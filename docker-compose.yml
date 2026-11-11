@@ -1,0 +1,104 @@
+name: objstore
+
+x-worker: &worker
+  build: .
+  command: ["python", "-m", "app.worker.main"]
+  restart: unless-stopped
+  networks: [internal]
+  depends_on:
+    controller:
+      condition: service_healthy
+  environment: &worker-env
+    CONTROLLER_URL: http://controller:8080
+    WORKER_PORT: "9000"
+    DATA_DIR: /data
+    HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-5}
+    SCRUB_INTERVAL: ${SCRUB_INTERVAL:-1800}
+    CHUNK_CACHE_ENABLED: ${CHUNK_CACHE_ENABLED:-true}
+    CHUNK_CACHE_BYTES: ${CHUNK_CACHE_BYTES:-134217728}
+    MAX_CONCURRENT_TRANSFERS: ${MAX_CONCURRENT_TRANSFERS:-8}
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:9000/healthz')"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-objstore}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-objstore}
+      POSTGRES_DB: ${POSTGRES_DB:-objstore}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-objstore} -d ${POSTGRES_DB:-objstore}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  controller:
+    build: .
+    container_name: controller
+    command: ["python", "-m", "app.controller.main"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-objstore}:${POSTGRES_PASSWORD:-objstore}@postgres:5432/${POSTGRES_DB:-objstore}
+      CONTROLLER_PORT: "8080"
+      STAGING_DIR: /staging
+      CHUNK_SIZE: ${CHUNK_SIZE:-1048576}
+      HEARTBEAT_TIMEOUT: ${HEARTBEAT_TIMEOUT:-15}
+      META_CACHE_ENABLED: ${META_CACHE_ENABLED:-true}
+      META_CACHE_SIZE: ${META_CACHE_SIZE:-1000}
+      META_CACHE_TTL: ${META_CACHE_TTL:-30}
+      MAX_CONCURRENT_TRANSFERS: ${MAX_CONCURRENT_TRANSFERS:-8}
+    volumes:
+      - staging:/staging
+    ports:
+      - "${CONTROLLER_PORT:-8090}:8080"
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker1:
+    <<: *worker
+    container_name: worker1
+    environment: {<<: *worker-env, WORKER_ID: worker1, WORKER_ADDRESS: "http://worker1:9000"}
+    volumes: ["worker1_data:/data"]
+  worker2:
+    <<: *worker
+    container_name: worker2
+    environment: {<<: *worker-env, WORKER_ID: worker2, WORKER_ADDRESS: "http://worker2:9000"}
+    volumes: ["worker2_data:/data"]
+  worker3:
+    <<: *worker
+    container_name: worker3
+    environment: {<<: *worker-env, WORKER_ID: worker3, WORKER_ADDRESS: "http://worker3:9000"}
+    volumes: ["worker3_data:/data"]
+  worker4:
+    <<: *worker
+    container_name: worker4
+    environment: {<<: *worker-env, WORKER_ID: worker4, WORKER_ADDRESS: "http://worker4:9000"}
+    volumes: ["worker4_data:/data"]
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  staging:
+  worker1_data:
+  worker2_data:
+  worker3_data:
+  worker4_data:
