@@ -10,23 +10,24 @@ _CODES = {
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str, code: str | None = None):
+    def __init__(self, status: int, message: str, code: str | None = None, extra: dict | None = None):
         self.status = status
         self.message = message
         self.code = code or _CODES.get(status, "error")
+        self.extra = extra or {}
 
 
-def _body(status: int, message: str, code: str | None = None) -> JSONResponse:
+def _body(status: int, message: str, code: str | None = None, extra: dict | None = None) -> JSONResponse:
     return JSONResponse(
         status_code=status,
-        content={"error": {"code": code or _CODES.get(status, "error"), "message": message}},
+        content={"error": {"code": code or _CODES.get(status, "error"), "message": message, **(extra or {})}},
     )
 
 
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def _api(_: Request, e: ApiError):
-        return _body(e.status, e.message, e.code)
+        return _body(e.status, e.message, e.code, e.extra)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http(_: Request, e: StarletteHTTPException):

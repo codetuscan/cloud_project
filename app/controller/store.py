@@ -1,5 +1,6 @@
 """PostgreSQL access: connection pool + plain-SQL migrations."""
 import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -9,10 +10,14 @@ log = logging.getLogger("store")
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
 
+async def _init(conn: asyncpg.Connection) -> None:
+    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+
+
 async def connect(dsn: str, attempts: int = 30) -> asyncpg.Pool:
     for i in range(1, attempts + 1):
         try:
-            return await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+            return await asyncpg.create_pool(dsn, min_size=2, max_size=10, init=_init)
         except (OSError, asyncpg.PostgresError) as e:
             log.warning("postgres not ready (%s/%s): %s", i, attempts, e)
             await asyncio.sleep(1)
