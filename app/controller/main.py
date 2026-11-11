@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,7 +10,8 @@ from app.common.config import settings
 from app.common.errors import install_error_handlers
 from app.common.logging import setup_logging
 from app.common.responses import JSONResponseNL
-from app.controller import store
+from app.controller import health, store
+from app.controller.internal_api import router as internal_router
 
 log = logging.getLogger("controller")
 
@@ -21,12 +23,16 @@ async def lifespan(app: FastAPI):
     app.state.pool = await store.connect(settings.database_url)
     await store.migrate(app.state.pool)
     log.info("controller ready (chunk_size=%d)", settings.chunk_size)
+    monitor = asyncio.create_task(
+        health.monitor(app.state.pool, settings.heartbeat_timeout, max(1.0, settings.heartbeat_interval / 2)))
     yield
+    monitor.cancel()
     await app.state.pool.close()
 
 
 app = FastAPI(title="Object Store Controller", lifespan=lifespan, default_response_class=JSONResponseNL)
 install_error_handlers(app)
+app.include_router(internal_router)
 
 
 @app.get("/healthz")
