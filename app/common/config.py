@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     meta_cache_enabled: bool = True
     meta_cache_size: int = 1000
     meta_cache_ttl: float = 30.0
+    upload_abandon_seconds: float = 3600.0
+    tombstone_retention_seconds: float = 86400.0
 
     # worker
     worker_id: str = "worker-local"

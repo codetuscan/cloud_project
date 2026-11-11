@@ -11,7 +11,7 @@ from app.common.config import settings
 from app.common.errors import install_error_handlers
 from app.common.logging import setup_logging
 from app.common.responses import JSONResponseNL
-from app.controller import health, store, upload
+from app.controller import health, reaper, store, upload
 from app.controller.api import router as api_router
 from app.controller.internal_api import router as internal_router
 
@@ -30,11 +30,13 @@ async def lifespan(app: FastAPI):
     junk = upload.cleanup_staging(settings.staging_dir)
     log.info("controller ready (chunk_size=%d, partial uploads removed=%d)", settings.chunk_size, junk)
     resumer = asyncio.create_task(upload.resume_loop(app.state))
+    reap = asyncio.create_task(reaper.run(app.state))
     monitor = asyncio.create_task(
         health.monitor(app.state.pool, settings.heartbeat_timeout, max(1.0, settings.heartbeat_interval / 2)))
     yield
     monitor.cancel()
     resumer.cancel()
+    reap.cancel()
     await app.state.http.aclose()
     await app.state.pool.close()
 
