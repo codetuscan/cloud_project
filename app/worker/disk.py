@@ -169,3 +169,43 @@ def list_chunks() -> list[dict]:
 def usage() -> dict:
     u = shutil.disk_usage(settings.data_dir)
     return {"capacity_bytes": u.total, "used_bytes": u.used, "free_bytes": u.free}
+
+
+# ---------------------------------------------------------------- scrubber support
+def scrub_candidates() -> list[str]:
+    """Chunk ids known locally: every chunk file and every checksum record (so a deleted
+    chunk file whose .sum survives is still noticed as MISSING)."""
+    ids: set[str] = set()
+    base = _root() / "chunks"
+    if base.exists():
+        for sub in base.iterdir():
+            if sub.is_dir():
+                for f in sub.iterdir():
+                    ids.add(f.name[:-4] if f.name.endswith(".sum") else f.name)
+    return sorted(ids)
+
+
+def read_sum(chunk_id: str) -> str | None:
+    try:
+        return sum_path(chunk_id).read_text().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def sum_age_seconds(chunk_id: str) -> float | None:
+    import time
+    try:
+        return time.time() - sum_path(chunk_id).stat().st_mtime
+    except FileNotFoundError:
+        return None
+
+
+def write_sum(chunk_id: str, checksum: str) -> None:
+    """Atomically (re)write the checksum record, e.g. after the controller confirmed it."""
+    sp = sum_path(chunk_id)
+    tmp = tmp_dir() / f"{chunk_id}.{uuid.uuid4().hex}.sum"
+    with open(tmp, "wb") as f:
+        f.write(checksum.encode())
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, sp)
