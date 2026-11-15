@@ -1,6 +1,7 @@
 """Public client API."""
 import asyncio
 import json
+import shutil
 import logging
 import uuid
 import base64
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 from app.common.config import settings
 from app.common.errors import ApiError
@@ -18,7 +20,9 @@ from app.common.responses import JSONResponseNL
 import httpx
 
 from app.common import checksum as cs
-from app.controller import placement, reaper, replicas, upload
+from app.common import chunking, metrics
+from app.common.gate import Busy
+from app.controller import meta_cache, placement, reaper, replicas, upload
 from app.controller.multipart_stream import StreamingUpload, UploadError
 
 log = logging.getLogger("controller.api")
@@ -73,8 +77,36 @@ def _parse_metadata(raw: bytes, allow_null: bool = False) -> dict:
     return meta
 
 
+def _busy(what: str) -> ApiError:
+    return ApiError(503, f"server busy: too many concurrent {what}; retry shortly", "server_busy",
+                    headers={"Retry-After": "5"})
+
+
 @router.post("/api/v1/objects", status_code=201)
 async def upload_object(request: Request):
+    """Admission control (bounded concurrent uploads) + size/space checks, then the real work."""
+    state = request.app.state
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit():
+        n = int(cl)
+        if settings.max_upload_bytes and n > settings.max_upload_bytes:
+            raise ApiError(400, f"upload exceeds the maximum of {settings.max_upload_bytes} bytes", "too_large")
+        free = await asyncio.to_thread(lambda: shutil.disk_usage(settings.staging_dir).free)
+        if n + 64 * 1024 * 1024 > free:
+            raise ApiError(503, "not enough free staging space for this upload", "staging_full")
+    try:
+        slot = await state.upload_gate.enter(settings.admission_timeout)
+    except Busy:
+        metrics.inc("uploads_rejected_busy")
+        raise _busy("uploads")
+    metrics.inc("uploads_started")
+    try:
+        return await _do_upload(request)
+    finally:
+        slot.release()
+
+
+async def _do_upload(request: Request):
     state = request.app.state
     ctype = request.headers.get("content-type", "")
     if not ctype.lower().startswith("multipart/form-data"):
@@ -100,6 +132,8 @@ async def upload_object(request: Request):
         su = StreamingUpload(ctype, part_path)
         async for data in request.stream():
             await asyncio.to_thread(su.feed, data)
+            if settings.max_upload_bytes and su.size > settings.max_upload_bytes:
+                raise UploadError(f"upload exceeds the maximum of {settings.max_upload_bytes} bytes")
         await asyncio.to_thread(su.finish)
         if su.file_parts == 0:
             raise UploadError("multipart field 'file' is required")
@@ -117,23 +151,28 @@ async def upload_object(request: Request):
     await asyncio.to_thread(part_path.replace, staged_path)
 
     chunk_size = settings.chunk_size
-    chunk_count = -(-su.size // chunk_size)
+    chunk_count = chunking.chunk_count(su.size, chunk_size)
     name = (su.filename or "unnamed")[:255]
-    async with state.pool.acquire() as c:
-        async with c.transaction():
-            await c.execute(
-                """INSERT INTO objects (object_id,name,size,content_type,checksum,chunk_count,chunk_size,
-                                        state,user_metadata,idempotency_key)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING',$8,$9)""",
-                object_id, name, su.size, su.content_type, su.checksum, chunk_count, chunk_size,
-                user_meta, idem)
-            await c.execute("INSERT INTO uploads (object_id, staged_path, state) VALUES ($1,$2,'STAGED')",
-                            object_id, str(staged_path))
+    try:
+        async with state.pool.acquire() as c:
+            async with c.transaction():
+                await c.execute(
+                    """INSERT INTO objects (object_id,name,size,content_type,checksum,chunk_count,chunk_size,
+                                            state,user_metadata,idempotency_key)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING',$8,$9)""",
+                    object_id, name, su.size, su.content_type, su.checksum, chunk_count, chunk_size,
+                    user_meta, idem)
+                await c.execute("INSERT INTO uploads (object_id, staged_path, state) VALUES ($1,$2,'STAGED')",
+                                object_id, str(staged_path))
+    except BaseException:
+        staged_path.unlink(missing_ok=True)  # no uploads row exists, so nothing could ever resume/clean this file
+        raise
 
     state.active_uploads.add(object_id)
     try:
         await upload.commit_upload(state, object_id)
     except upload.UploadUnavailable as e:
+        metrics.inc("uploads_pending_503")
         log.warning("upload %s not committed yet: %s", object_id, e)
         raise ApiError(503, "not enough healthy workers to store 2 replicas right now; the upload is "
                             "kept in staging and will be completed automatically when workers recover",
@@ -142,6 +181,8 @@ async def upload_object(request: Request):
     finally:
         state.active_uploads.discard(object_id)
 
+    metrics.inc("uploads_committed")
+    metrics.inc("upload_bytes", su.size)
     obj = await state.pool.fetchrow("SELECT * FROM objects WHERE object_id=$1", object_id)
     return JSONResponseNL(status_code=201, content=_object_json(obj))
 
@@ -156,28 +197,23 @@ def _discard(su, path: Path) -> None:
 async def get_metadata(object_id: str, request: Request):
     oid = _parse_uuid(object_id)
     pool = request.app.state.pool
-    obj = await pool.fetchrow("SELECT * FROM objects WHERE object_id=$1 AND state='COMMITTED'", oid)
-    if obj is None:
+    m = await meta_cache.get_manifest(pool, oid)
+    if m is None:
         raise ApiError(404, "object not found")
-    chunks = await pool.fetch(
-        "SELECT chunk_index, chunk_id, size, checksum FROM chunks WHERE object_id=$1 ORDER BY chunk_index", oid)
-    reps = await pool.fetch(
-        """SELECT r.chunk_id, r.worker_id, r.state FROM replicas r JOIN chunks c USING (chunk_id)
-           WHERE c.object_id=$1 ORDER BY r.worker_id""", oid)
-    by_chunk: dict[str, list] = {}
-    for r in reps:
-        by_chunk.setdefault(r["chunk_id"], []).append({"worker_id": r["worker_id"], "state": r["state"]})
-    body = _object_json(obj)
+    body = _object_json(m["obj"])
     body["chunks"] = [
         {"index": c["chunk_index"], "chunk_id": c["chunk_id"], "size": c["size"], "checksum": c["checksum"],
-         "replicas": by_chunk.get(c["chunk_id"], [])} for c in chunks]
+         "replicas": [{"worker_id": r["worker_id"], "state": r["state"]} for r in c["replicas"]]}
+        for c in m["chunks"]]
     return body
 
 
 # ---------------------------------------------------------------- download
 async def _fetch_chunk(state, chunk, candidates: list[dict]) -> bytes:
     """Return verified bytes for one chunk, trying each healthy replica; report bad ones."""
-    for rep in candidates:
+    for attempt, rep in enumerate(candidates):
+        if attempt:
+            metrics.inc("replica_read_fallbacks")
         try:
             async with state.transfer_sem:
                 r = await state.http.get(f"{rep['address']}/internal/chunks/{chunk['chunk_id']}")
@@ -208,18 +244,12 @@ async def download_object(object_id: str, request: Request):
     oid = _parse_uuid(object_id)
     state = request.app.state
     pool = state.pool
-    obj = await pool.fetchrow("SELECT * FROM objects WHERE object_id=$1 AND state='COMMITTED'", oid)
-    if obj is None:
+    m = await meta_cache.get_manifest(pool, oid)
+    if m is None:
         raise ApiError(404, "object not found")
-    chunks = await pool.fetch(
-        "SELECT chunk_id, chunk_index, size, checksum FROM chunks WHERE object_id=$1 ORDER BY chunk_index", oid)
-    reps = await pool.fetch(
-        """SELECT r.chunk_id, r.worker_id, w.address FROM replicas r JOIN workers w USING (worker_id)
-           WHERE r.state='HEALTHY' AND w.state <> 'DEAD'
-             AND r.chunk_id IN (SELECT chunk_id FROM chunks WHERE object_id=$1)""", oid)
-    by_chunk: dict[str, list[dict]] = {}
-    for r in reps:
-        by_chunk.setdefault(r["chunk_id"], []).append(dict(r))
+    obj, chunks = m["obj"], m["chunks"]
+    by_chunk = {c["chunk_id"]: [r for r in c["replicas"] if r["state"] == "HEALTHY" and r["wstate"] != "DEAD"]
+                for c in chunks}
     if len(chunks) != obj["chunk_count"]:
         raise ApiError(500, "object manifest is incomplete")
     # fail before sending headers if some chunk has no replica at all
@@ -227,12 +257,28 @@ async def download_object(object_id: str, request: Request):
         if not by_chunk.get(c["chunk_id"]):
             raise ApiError(503, f"no healthy replica available for chunk {c['chunk_index']}")
 
+    try:
+        slot = await state.download_gate.enter(settings.admission_timeout)
+    except Busy:
+        metrics.inc("downloads_rejected_busy")
+        raise _busy("downloads")
+    metrics.inc("downloads_started")
+
     async def body():
-        for c in chunks:
-            cands = by_chunk[c["chunk_id"]][:]
-            random.shuffle(cands)
-            # raising here aborts the connection: the client never gets a silently truncated object
-            yield await _fetch_chunk(state, c, cands)
+        try:
+            for c in chunks:
+                cands = by_chunk[c["chunk_id"]][:]
+                random.shuffle(cands)
+                # raising here aborts the connection: the client never gets a silently truncated object
+                data = await _fetch_chunk(state, c, cands)
+                metrics.inc("download_bytes", len(data))
+                yield data
+            metrics.inc("downloads_completed")
+        except BaseException:
+            metrics.inc("downloads_aborted")
+            raise
+        finally:
+            slot.release()
 
     fname = obj["name"]
     ascii_name = fname.encode("ascii", "replace").decode().replace('"', "'").replace("?", "_")
@@ -242,7 +288,8 @@ async def download_object(object_id: str, request: Request):
         "X-Object-Checksum": obj["checksum"] or "",
         "ETag": f'"{(obj["checksum"] or "")[7:]}"',
     }
-    return StreamingResponse(body(), media_type=obj["content_type"], headers=headers)
+    return StreamingResponse(body(), media_type=obj["content_type"], headers=headers,
+                             background=BackgroundTask(slot.release))
 
 
 # ---------------------------------------------------------------- list
@@ -298,6 +345,7 @@ async def patch_metadata(object_id: str, request: Request):
     row = await request.app.state.pool.fetchrow(
         """UPDATE objects SET user_metadata = jsonb_strip_nulls(user_metadata || $2::jsonb), updated_at=now()
            WHERE object_id=$1 AND state='COMMITTED' RETURNING *""", oid, patch)
+    meta_cache.invalidate_object(oid)
     if row is None:
         raise ApiError(404, "object not found")
     return _object_json(row)
@@ -311,6 +359,18 @@ async def delete_object(object_id: str, request: Request):
     async with pool.acquire() as c:
         async with c.transaction():
             ok = await reaper.begin_delete(c, oid, ("COMMITTED",))
+    meta_cache.invalidate_object(oid)  # after the commit: a re-fill now sees the DELETING state
     if not ok:
         raise ApiError(404, "object not found")
     return Response(status_code=204)
+
+
+@router.get("/internal/cache/stats")
+async def cache_stats():
+    return {"metadata_cache": meta_cache.cache.stats()}
+
+
+@router.post("/internal/cache/clear")
+async def cache_clear():
+    meta_cache.invalidate_all()
+    return {"status": "cleared"}

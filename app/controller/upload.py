@@ -7,8 +7,9 @@ from pathlib import Path
 import httpx
 
 from app.common import checksum as cs
+from app.common import chunking, metrics
 from app.common.config import settings
-from app.controller import placement
+from app.controller import meta_cache, placement
 
 log = logging.getLogger("controller.upload")
 
@@ -57,8 +58,7 @@ async def _send(state, target: placement.Target, chunk_id: str, checksum: str, d
 async def _process_chunk(state, obj, index: int, path: str) -> None:
     pool = state.pool
     cs_size = obj["chunk_size"]
-    offset = index * cs_size
-    length = min(cs_size, obj["size"] - offset)
+    offset, length = chunking.chunk_span(index, obj["size"], cs_size)
     data = await asyncio.to_thread(_read_slice, path, offset, length)
     checksum = cs.sha256_bytes(data)
     chunk_id = chunk_id_for(obj["object_id"], index)
@@ -153,6 +153,7 @@ async def commit_upload(state, object_id) -> bool:
             await c.execute("UPDATE objects SET state='COMMITTED', updated_at=now() "
                             "WHERE object_id=$1 AND state='PENDING'", object_id)
             await c.execute("DELETE FROM uploads WHERE object_id=$1", object_id)
+    meta_cache.invalidate_object(object_id)
     Path(path).unlink(missing_ok=True)  # cleanup policy: staged source removed after commit
     log.info("object %s committed (%d chunks)", object_id, obj["chunk_count"])
     return True

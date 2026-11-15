@@ -8,9 +8,10 @@ from fastapi import FastAPI
 
 from app.common.config import settings
 from app.common.errors import install_error_handlers
+from app.common.requestid import RequestIdMiddleware
 from app.common.logging import setup_logging
 from app.common.responses import JSONResponseNL
-from app.worker import agent, disk
+from app.worker import agent, disk, scrub
 from app.worker.api import router
 
 log = logging.getLogger("worker")
@@ -23,13 +24,16 @@ async def lifespan(app: FastAPI):
     removed = disk.init()
     log.info("worker %s ready (data_dir=%s, stale tmp files removed=%d, chunks on disk=%d)",
              settings.worker_id, settings.data_dir, removed, len(disk.list_chunks()))
-    task = asyncio.create_task(agent.run())
+    tasks = [asyncio.create_task(agent.run()), asyncio.create_task(scrub.scrub_loop()),
+             asyncio.create_task(scrub.delivery_loop())]
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
 
 
 app = FastAPI(title="Object Store Worker", lifespan=lifespan, default_response_class=JSONResponseNL)
 install_error_handlers(app)
+app.add_middleware(RequestIdMiddleware)
 app.include_router(router)
 
 
@@ -39,4 +43,5 @@ async def healthz():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=settings.worker_port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=settings.worker_port, log_level="info",
+                limit_concurrency=settings.max_http_concurrency, timeout_keep_alive=5)

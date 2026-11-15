@@ -8,7 +8,10 @@ import mimetypes
 import os
 from pathlib import Path
 
-from multipart.multipart import MultipartParser, parse_options_header
+try:  # python-multipart >= 0.0.13 ships the `python_multipart` package name
+    from python_multipart.multipart import MultipartParser, parse_options_header
+except ImportError:  # older releases
+    from multipart.multipart import MultipartParser, parse_options_header
 
 MAX_META_BYTES = 64 * 1024
 
