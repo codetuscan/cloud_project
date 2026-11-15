@@ -39,12 +39,19 @@ docker start $W1 >/dev/null; sleep 8
 echo "== Read fallback: corrupted replica on disk =="
 M=$(curl -s $API/api/v1/objects/$OID/metadata)
 CID=$(jget "d['chunks'][1]['chunk_id']" <<<"$M"); W2=$(jget "d['chunks'][1]['replicas'][0]['worker_id']" <<<"$M")
+docker exec $W2 curl -s -X POST localhost:9000/internal/cache/clear >/dev/null   # drop RAM copy so reads hit the corrupted file
 docker exec $W2 sh -c "printf XXXX >> /data/chunks/${CID:0:2}/$CID"
 echo "  corrupted chunk 1 ($CID) on $W2"
-for i in 1 2 3 4 5 6; do curl -s -o $T/dl3.bin $API/api/v1/objects/$OID; [ "$(sha256sum < $T/dl3.bin)" = "$SUM" ] || break; done
-check "download correct despite corrupt replica (6 tries)" "$(sha256sum < $T/dl3.bin)" "$SUM"
-check "corrupt replica reported -> state CORRUPT" "$(sql "select state from replicas where chunk_id='$CID' and worker_id='$W2'")" CORRUPT
-check "repair task queued" "$(sql "select count(*) from repair_tasks where chunk_id='$CID' and state='PENDING'")" 1
+# every read picks a random replica; keep reading (always checking the bytes) until the bad one has been hit
+ALLGOOD=yes
+for i in $(seq 1 25); do
+  curl -s -o $T/dl3.bin $API/api/v1/objects/$OID; [ "$(sha256sum < $T/dl3.bin)" = "$SUM" ] || ALLGOOD=no
+  [ "$(sql "select count(*) from repair_tasks where chunk_id='$CID' and reason like 'read:%'")" -ge 1 ] && break
+done
+check "every download was byte-identical despite the corrupt replica" "$ALLGOOD" yes
+check "read detected it: repair task with a read-time reason exists (it may already be DONE: repair is fast)" "$([ "$(sql "select count(*) from repair_tasks where chunk_id='$CID' and reason like 'read:%'")" -ge 1 ] && echo yes)" yes
+for i in $(seq 1 15); do [ "$(sql "select state from replicas where chunk_id='$CID' and worker_id='$W2'")" = HEALTHY ] && break; sleep 2; done
+check "the damaged replica ends up repaired (HEALTHY again)" "$(sql "select state from replicas where chunk_id='$CID' and worker_id='$W2'")" HEALTHY
 
 echo "== Both replicas of a chunk gone: must fail, never truncate silently =="
 M=$(curl -s $API/api/v1/objects/$OID/metadata)

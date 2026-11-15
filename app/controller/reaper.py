@@ -11,7 +11,9 @@ from pathlib import Path
 
 import httpx
 
+from app.common import metrics
 from app.common.config import settings
+from app.controller import meta_cache
 
 log = logging.getLogger("controller.reaper")
 INTERVAL = 3.0
@@ -52,6 +54,8 @@ async def _delete_replicas(state) -> int:
                 if resp.status_code in (200, 204, 404):
                     await pool.execute("DELETE FROM replicas WHERE chunk_id=$1 AND worker_id=$2 AND state='DELETING'",
                                        r["chunk_id"], r["worker_id"])
+                    meta_cache.invalidate_chunk(r["chunk_id"])
+                    metrics.inc("replicas_deleted")
                     done += 1
                 else:
                     log.warning("delete %s on %s -> %s", r["chunk_id"], r["worker_id"], resp.status_code)
@@ -67,6 +71,7 @@ async def _finalize(pool) -> None:
         """SELECT o.object_id FROM objects o WHERE o.state='DELETING' AND NOT EXISTS
            (SELECT 1 FROM replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id=o.object_id)""")
     for r in rows:
+        meta_cache.invalidate_object(r["object_id"])
         async with pool.acquire() as c:
             async with c.transaction():
                 await c.execute("DELETE FROM chunks WHERE object_id=$1", r["object_id"])

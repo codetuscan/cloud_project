@@ -2,6 +2,8 @@
 import logging
 import uuid
 
+from app.controller import meta_cache
+
 log = logging.getLogger("controller.replicas")
 
 
@@ -22,6 +24,7 @@ async def mark_bad(pool, chunk_id: str, worker_id: str, state: str, reason: str)
                     """INSERT INTO repair_tasks (task_id, chunk_id, target_worker_id, reason, state)
                        VALUES ($1,$2,$3,$4,'PENDING') ON CONFLICT DO NOTHING""",
                     uuid.uuid4(), chunk_id, worker_id, reason)
+    meta_cache.invalidate_chunk(chunk_id)
     if changed:
         log.warning("replica %s on %s marked %s (%s); repair queued", chunk_id, worker_id, state, reason)
     return bool(changed)

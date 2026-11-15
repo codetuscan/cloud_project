@@ -40,6 +40,7 @@ n=$(w curl -s $W/internal/workers/worker1/chunks | grep -c "$CID")
 check "inventory lists the chunk" "$n" 1
 
 echo "  -- corrupt the file on disk; GET must refuse to return bad bytes"
+w curl -s -X POST $W/internal/cache/clear >/dev/null   # RAM cache would otherwise keep serving the good copy
 w sh -c "printf X >> /data/chunks/${CID:0:2}/$CID"
 code=$(w curl -s -o /dev/null -w '%{http_code}' $W/internal/chunks/$CID)
 check "GET of corrupted chunk -> 500 (not served)" "$code" 500
