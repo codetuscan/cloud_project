@@ -15,7 +15,6 @@ import uuid
 
 import httpx
 
-from app.common import checksum as cs
 from app.common import metrics
 from app.common.config import settings
 from app.controller import meta_cache, placement, replicas
@@ -41,39 +40,39 @@ async def _retry(pool, task, why: str) -> None:
     log.warning("repair of %s postponed (%ss): %s", task["chunk_id"], delay, why)
 
 
-async def _read_source(state, chunk, src) -> bytes | None:
+async def _command_copy(state, src, tgt, chunk) -> str:
+    """Tell worker `src` to push the chunk straight to worker `tgt`; no chunk bytes pass through the controller.
+
+    The source verifies the chunk against its own record AND our checksum, the target verifies it again before
+    acknowledging. Returns: ok | source_missing | source_corrupt | source_unreachable | target_failed.
+    """
     try:
         async with state.transfer_sem:
-            r = await state.http.get(f"{src['address']}/internal/chunks/{chunk['chunk_id']}")
+            r = await state.http.post(
+                f"{src['address']}/internal/chunks/{chunk['chunk_id']}/send",
+                json={"target_address": tgt["address"], "checksum": chunk["checksum"], "size": chunk["size"]},
+                timeout=45.0)
     except httpx.HTTPError as e:
         log.warning("repair source %s unreachable: %r", src["worker_id"], e)
-        return None
-    if r.status_code == 404:
-        await replicas.mark_bad(state.pool, chunk["chunk_id"], src["worker_id"], "MISSING", "repair source: 404")
-        return None
+        return "source_unreachable"
     if r.status_code != 200:
-        if "chunk_corrupt" in r.text:
-            await replicas.mark_bad(state.pool, chunk["chunk_id"], src["worker_id"], "CORRUPT",
-                                    "repair source: self-check failed")
-        return None
-    data = r.content
-    if len(data) != chunk["size"] or cs.sha256_bytes(data) != chunk["checksum"]:
+        log.warning("repair source %s refused the copy command: %s %s", src["worker_id"], r.status_code, r.text[:200])
+        return "source_unreachable"
+    body = r.json()
+    if body.get("ok"):
+        metrics.inc("repair_direct_copies")
+        return "ok"
+    reason = body.get("reason")
+    if reason == "source_missing":
+        await replicas.mark_bad(state.pool, chunk["chunk_id"], src["worker_id"], "MISSING", "repair source: 404")
+        return reason
+    if reason == "source_corrupt":
         await replicas.mark_bad(state.pool, chunk["chunk_id"], src["worker_id"], "CORRUPT",
-                                "repair source: checksum mismatch")
-        return None
-    return data
-
-
-async def _write_target(state, tgt, chunk, data: bytes) -> bool:
-    try:
-        async with state.transfer_sem:
-            r = await state.http.put(
-                f"{tgt['address']}/internal/chunks/{chunk['chunk_id']}?repair=true", content=data,
-                headers={"X-Chunk-Checksum": chunk["checksum"], "Content-Type": "application/octet-stream"})
-        return r.status_code in (200, 201)
-    except httpx.HTTPError as e:
-        log.warning("repair target %s failed: %r", tgt["worker_id"], e)
-        return False
+                                f"repair source: self-check failed ({body.get('detail', '')[:120]})")
+        return reason
+    log.warning("repair copy %s: %s -> %s failed: %s", chunk["chunk_id"], src["worker_id"], tgt["worker_id"],
+                body.get("detail", ""))
+    return "target_failed"
 
 
 # ------------------------------------------------------------------ task execution
@@ -122,32 +121,40 @@ async def execute(state, task) -> None:
     if not targets:
         return await _retry(pool, task, "degraded: no eligible worker to hold another replica")
 
-    data = None
-    source_id = None
+    # The controller only sends commands: a healthy source worker pushes the chunk directly to each target.
+    done: dict[str, str] = {}  # target worker_id -> the source worker that delivered it
+    remaining = list(targets)
     random.shuffle(sources)
     for src in sources:
-        data = await _read_source(state, chunk, src)
-        if data is not None:
-            source_id = src["worker_id"]
-            await pool.execute("UPDATE repair_tasks SET source_worker_id=$2, target_worker_id=$3 WHERE task_id=$1",
-                               task["task_id"], source_id, ",".join(t["worker_id"] for t in targets))
+        if not remaining:
             break
-    if data is None:
+        outcomes = await asyncio.gather(*[_command_copy(state, src, t, chunk) for t in remaining])
+        next_source = []
+        for t, outcome in zip(remaining, outcomes):
+            if outcome == "ok":
+                done[t["worker_id"]] = src["worker_id"]
+            elif outcome != "target_failed":  # this SOURCE was the problem: let the next source try
+                next_source.append(t)
+            # target_failed: the target is the problem; leave it for the retry below
+        remaining = next_source
+
+    if not done:
         for wid in new_ids:
             await pool.execute("DELETE FROM replicas WHERE chunk_id=$1 AND worker_id=$2 AND state='PENDING'",
                                chunk["chunk_id"], wid)
         meta_cache.invalidate_chunk(chunk["chunk_id"])
-        return await _retry(pool, task, "no source returned verified bytes")
+        return await _retry(pool, task, "no source could deliver verified bytes to a target")
 
-    results = await asyncio.gather(*[_write_target(state, t, chunk, data) for t in targets])
-    for t, okw in zip(targets, results):
-        if okw:
+    await pool.execute("UPDATE repair_tasks SET source_worker_id=$2, target_worker_id=$3 WHERE task_id=$1",
+                       task["task_id"], next(iter(done.values())), ",".join(t["worker_id"] for t in targets))
+    for t in targets:
+        if t["worker_id"] in done:
             await pool.execute(
                 """UPDATE replicas SET state='HEALTHY', last_verified=now(), updated_at=now()
                    WHERE chunk_id=$1 AND worker_id=$2""", chunk["chunk_id"], t["worker_id"])
             meta_cache.invalidate_chunk(chunk["chunk_id"])
-            log.info("repaired %s: copied from %s to %s (checksum verified, fsynced)",
-                     chunk["chunk_id"], source_id, t["worker_id"])
+            log.info("repaired %s: copied directly from %s to %s (checksum verified, fsynced)",
+                     chunk["chunk_id"], done[t["worker_id"]], t["worker_id"])
         elif t["worker_id"] in new_ids:
             await pool.execute("DELETE FROM replicas WHERE chunk_id=$1 AND worker_id=$2 AND state='PENDING'",
                                chunk["chunk_id"], t["worker_id"])

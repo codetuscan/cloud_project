@@ -28,6 +28,21 @@ check "object still downloads identically" "$(curl -s $API/api/v1/objects/$OID |
 check "object still listed" "$(curl -s "$API/api/v1/objects?limit=1000" | grep -c $OID)" 1
 cluster_up
 
+echo "== 1b. Controller down LONGER than the heartbeat timeout, workers alive: nobody is declared dead =="
+# Heartbeat times live in PostgreSQL and keep ageing while the controller is down. On restart the controller
+# must first ask the workers whether they are alive instead of trusting those stale timestamps.
+TASKS_BEFORE=$(docker exec postgres psql -U objstore -d objstore -tAc "select count(*) from repair_tasks")
+docker stop controller >/dev/null
+echo "  controller stopped for 25 s (heartbeat timeout is 15 s)"; sleep 25
+docker start controller >/dev/null
+wait_until "controller back" 60 "curl -sf $API/healthz"
+cluster_up
+sleep 12
+check "no worker was marked DEAD after the restart" "$(curl -s $API/internal/metrics | jget "d['counters'].get('workers_marked_dead',0)")" 0
+check "start-up probe found all 4 workers alive" "$(curl -s $API/internal/metrics | jget "d['counters'].get('startup_probe_alive',0)")" 4
+check "no repair tasks were created by the restart" "$(docker exec postgres psql -U objstore -d objstore -tAc "select count(*) from repair_tasks")" "$TASKS_BEFORE"
+check "no chunk is under-replicated" "$(curl -s $API/internal/status | jget "d['under_replicated_chunks']")" 0
+
 echo "== 2. Controller restart while an upload is waiting in staging =="
 docker stop worker2 worker3 worker4 >/dev/null
 R=$(curl -s -w '\n%{http_code}' -F file=@$T/a.bin $API/api/v1/objects); PID=$(sed '$d' <<<"$R" | jget "d['error']['object_id']")

@@ -9,6 +9,32 @@ from app.controller import meta_cache
 log = logging.getLogger("controller.health")
 
 
+async def probe_workers(pool, http, timeout: float = 3.0) -> tuple[int, int]:
+    """At controller start: ask every known worker whether it is alive, before anyone is judged.
+
+    Heartbeat times live in PostgreSQL and keep ageing while the controller is down, so right after a restart
+    every worker looks silent. Pinging them first refreshes the ones that answer; only workers that really
+    do not respond are left for the monitor to declare DEAD. Returns (alive, unreachable).
+    """
+    rows = await pool.fetch("SELECT worker_id, address FROM workers WHERE state <> 'DEAD'")
+
+    async def one(w):
+        try:
+            r = await http.get(f"{w['address']}/healthz", timeout=timeout)
+            return w["worker_id"], r.status_code == 200
+        except Exception:
+            return w["worker_id"], False
+
+    results = await asyncio.gather(*[one(w) for w in rows])
+    alive = [wid for wid, ok in results if ok]
+    if alive:
+        await pool.execute("UPDATE workers SET last_heartbeat=now() WHERE worker_id = ANY($1::text[])", alive)
+    down = [wid for wid, ok in results if not ok]
+    metrics.inc("startup_probe_alive", len(alive))
+    log.info("startup probe: %d worker(s) alive%s", len(alive), f", unreachable: {down}" if down else "")
+    return len(alive), len(down)
+
+
 async def monitor(pool, timeout: float, interval: float) -> None:
     last_db_failure = float("-inf")
     while True:

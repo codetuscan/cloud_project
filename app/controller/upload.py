@@ -55,6 +55,44 @@ async def _send(state, target: placement.Target, chunk_id: str, checksum: str, d
     raise RuntimeError(f"PUT {chunk_id} to {target.worker_id} failed: {last!r}")
 
 
+class _NotAttempted(Exception):
+    """The chain never reached this worker (its predecessor failed first), so it holds nothing and is not at fault."""
+
+
+async def _send_chain(state, first: placement.Target, second: placement.Target, chunk_id: str, checksum: str,
+                      data: bytes) -> list:
+    """Chain replication: PUT the chunk to ONE worker and name the next. That worker stores it, forwards it to
+    `second`, and answers only when it knows what happened to both copies.
+
+    Returns [outcome for first, outcome for second]; each is None (stored durably) or an Exception.
+    """
+    last: Exception | None = None
+    async with state.transfer_sem:
+        for attempt in range(PUT_ATTEMPTS):
+            try:
+                r = await state.http.put(
+                    f"{first.address}/internal/chunks/{chunk_id}", content=data,
+                    headers={"X-Chunk-Checksum": checksum, "Content-Type": "application/octet-stream",
+                             "X-Forward-To": second.address, "X-Forward-Worker-Id": second.worker_id})
+                if r.status_code in (200, 201):
+                    metrics.inc("chunk_chain_puts")
+                    fwd = next((x for x in r.json().get("replicas", []) if x.get("worker_id") == second.worker_id),
+                               None)
+                    if fwd is not None and fwd.get("ok"):
+                        return [None, None]
+                    # first copy is durable; the forward failed (the worker already retried it)
+                    why = (fwd or {}).get("error", "no forward result returned")
+                    return [None, RuntimeError(f"{first.worker_id} could not forward to {second.worker_id}: {why}")]
+                if r.status_code in (400, 409):  # deterministic rejection: don't retry
+                    err = RuntimeError(f"{first.worker_id} rejected chunk: {r.status_code} {r.text.strip()}")
+                    return [err, _NotAttempted()]
+                last = RuntimeError(f"{first.worker_id} returned {r.status_code}")
+            except httpx.HTTPError as e:
+                last = e
+            await asyncio.sleep(0.2 * (2 ** attempt))
+    return [RuntimeError(f"PUT {chunk_id} to {first.worker_id} failed: {last!r}"), _NotAttempted()]
+
+
 async def _process_chunk(state, obj, index: int, path: str) -> None:
     pool = state.pool
     cs_size = obj["chunk_size"]
@@ -88,10 +126,17 @@ async def _process_chunk(state, obj, index: int, path: str) -> None:
                 """INSERT INTO replicas (chunk_id, worker_id, state) VALUES ($1,$2,'PENDING')
                    ON CONFLICT (chunk_id, worker_id) DO UPDATE SET state='PENDING', updated_at=now()""",
                 chunk_id, t.worker_id)
-        results = await asyncio.gather(
-            *[_send(state, t, chunk_id, checksum, data) for t in targets], return_exceptions=True)
+        if len(targets) == 2:
+            # the controller uploads ONE copy; the first worker forwards it to the second
+            results = await _send_chain(state, targets[0], targets[1], chunk_id, checksum, data)
+        else:
+            results = await asyncio.gather(
+                *[_send(state, t, chunk_id, checksum, data) for t in targets], return_exceptions=True)
         for t, res in zip(targets, results):
-            if isinstance(res, Exception):
+            if isinstance(res, _NotAttempted):  # never received it: free the slot, don't blame the worker
+                await pool.execute("DELETE FROM replicas WHERE chunk_id=$1 AND worker_id=$2 AND state='PENDING'",
+                                   chunk_id, t.worker_id)
+            elif isinstance(res, Exception):
                 log.warning("replica placement failed: %s", res)
                 failed.add(t.worker_id)
                 await pool.execute("DELETE FROM replicas WHERE chunk_id=$1 AND worker_id=$2 AND state='PENDING'",
@@ -159,13 +204,32 @@ async def commit_upload(state, object_id) -> bool:
     return True
 
 
-def cleanup_staging(staging_dir: str) -> int:
-    """At startup nothing is streaming, so partial *.uploading files are garbage."""
-    n = 0
-    for f in Path(staging_dir).glob("*.uploading"):
+async def recover_staging(pool, staging_dir: str) -> dict:
+    """Run once at start-up, before the resume loop and before any request: make staging and the database agree.
+
+    Nothing is streaming at this point, so:
+      * uploads.state='STREAMING'  -> cut off before it was ever acknowledged: drop the rows (uploads cascades)
+      * STAGED row + <id>.uploading -> crash between the commit point and the rename: finish the rename
+      * <id>.uploading without a STAGED row, <id>.staged without any upload row -> garbage, delete it
+    """
+    out = {"streaming_dropped": 0, "renames_finished": 0, "files_removed": 0}
+    rows = await pool.fetch("SELECT object_id, state FROM uploads")
+    for r in rows:
+        if r["state"] == "STREAMING":
+            await pool.execute("DELETE FROM objects WHERE object_id=$1 AND state='PENDING'", r["object_id"])
+            out["streaming_dropped"] += 1
+    staged = {str(r["object_id"]) for r in rows if r["state"] == "STAGED"}
+    for f in sorted(Path(staging_dir).iterdir()):
+        if not f.is_file() or f.suffix not in (".uploading", ".staged"):
+            continue
+        if f.stem in staged:
+            if f.suffix == ".uploading":
+                f.replace(f.with_suffix(".staged"))
+                out["renames_finished"] += 1
+            continue
         f.unlink(missing_ok=True)
-        n += 1
-    return n
+        out["files_removed"] += 1
+    return out
 
 
 async def resume_loop(state) -> None:
@@ -174,7 +238,7 @@ async def resume_loop(state) -> None:
         try:
             rows = await state.pool.fetch(
                 """SELECT u.object_id FROM uploads u JOIN objects o USING (object_id)
-                   WHERE o.state='PENDING' ORDER BY o.created_at""")
+                   WHERE o.state='PENDING' AND u.state='STAGED' ORDER BY o.created_at""")  # never a STREAMING one
             for r in rows:
                 oid = r["object_id"]
                 if oid in state.active_uploads:

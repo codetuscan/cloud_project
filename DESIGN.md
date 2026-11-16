@@ -37,18 +37,35 @@ A chunk is **protected** when it has two `HEALTHY` replicas on two different *li
 ## 4. Upload (`app/controller/api.py`, `upload.py`, `multipart_stream.py`)
 
 1. Admission control (bounded concurrent uploads, size cap, staging-space check).
-2. The multipart body is parsed incrementally and the `file` part is written straight to a **persistent staging
-   file** (never into RAM, never into an ephemeral temp dir) while the whole-object SHA-256 is computed.
-3. In one transaction: `objects` row `PENDING` + `uploads` row; the file is renamed `*.uploading → *.staged`.
+2. **The database is told first.** Before any byte is stored, one transaction inserts the `objects` row (`PENDING`,
+   placeholder name/size) and the `uploads` row (`STREAMING`), with the `Idempotency-Key`.
+3. The multipart body is parsed incrementally and the `file` part is written straight to a **persistent staging
+   file** `<id>.uploading` (never into RAM, never into an ephemeral temp dir) while the whole-object SHA-256 is
+   computed; the file is fsynced when the part ends. Then **one transaction** writes the real name, size, content type,
+   checksum, chunk count and custom metadata *and* sets `uploads.state='STAGED'`. That is the commit point of the
+   upload: before it the attempt can be discarded, after it the controller promises to finish it. Only then is the file
+   renamed `*.uploading → *.staged` (housekeeping). A client disconnect or error before the commit point removes the
+   row and the partial file.
 4. `commit_upload`: a small pool (≤ 4) of tasks reads the staged file one chunk at a time (`pread` at
-   `index × chunk_size`), hashes it, records the chunk, picks **two distinct HEALTHY workers** (least loaded first),
-   `PUT`s the chunk to both in parallel with retries, and on failure fails over to another worker.
+   `index × chunk_size`), hashes it, records the chunk and picks **two distinct HEALTHY workers** (least loaded first).
+   It uploads the chunk **once**, to the first worker, naming the second in `X-Forward-To`. That worker verifies,
+   fsyncs and renames its copy, **forwards the same bytes to the second worker** (chain replication), and acknowledges
+   only when it knows the outcome of both copies (`replicas: [{worker_id, ok}, …]`). The controller marks each replica
+   `HEALTHY` from that reply. If only one copy failed, the next round asks for just the missing one; if the first
+   worker is unreachable, the second is not blamed and the pair is re-picked.
 5. When every chunk has two `HEALTHY` replicas on different workers, one transaction sets `COMMITTED`; the staged
    file is deleted (cleanup policy: remove after commit, abort after `UPLOAD_ABANDON_SECONDS`).
 6. If it cannot reach two replicas the client gets `503` but the object stays `PENDING` in staging; a resume loop
    (also run at startup) finishes it later. Work is idempotent (chunk ids are deterministic, a chunk that already has
    two healthy replicas is skipped, `PUT` of identical bytes is a no-op), so retries never duplicate chunks.
    `Idempotency-Key` prevents duplicate *objects* from client retries.
+
+Crash safety of staging: a complete staged file always has a complete row, and a `STREAMING` row never promises a
+file. At start-up, before the resume loop, `recover_staging` drops `STREAMING` rows and their partial files, finishes a
+rename interrupted after the commit point, and deletes staging files that have no row. A retry that finds a dead
+`STREAMING` row holding its `Idempotency-Key` (not in `active_uploads`; valid because there is one controller) clears
+it instead of answering 409; two simultaneous uploads with one key are serialised by the key's unique index (409).
+Tested by `scripts/phase11_upload_crash_test.sh`.
 
 Durability limits (as planned): a controller *process/container* restart loses nothing; loss of the controller
 *host disk* loses data that is only staged.
@@ -65,15 +82,23 @@ silently truncated, reordered or corrupted object.
 ## 6. Failure handling and repair (`repair.py`, `health.py`)
 
 * **Heartbeats** (worker → controller every 5 s). No heartbeat for 15 s ⇒ `DEAD`; a heartbeat revives it.
+  Heartbeat times are stored in PostgreSQL, so they keep ageing while the *controller* is down. To avoid declaring
+  every worker dead on restart, the controller first **probes each known worker (`GET /healthz`) at start-up** and
+  refreshes the ones that answer; only workers that really do not respond are left for the monitor to mark `DEAD`.
+  After a PostgreSQL outage the monitor additionally waits one full timeout before judging anyone.
 * **Under-replication scanner** (every 10 s): chunks of committed objects with fewer than two healthy replicas on live
   workers get one repair task each. Surplus replicas (e.g. a revived worker after its chunks were re-replicated) are
   trimmed, removing the copy on the most loaded worker.
-* **Repair runners** claim tasks with `SELECT … FOR UPDATE SKIP LOCKED`, copy a **verified** chunk from a healthy
-  source and `PUT … ?repair=true` to the target (repair in place on the worker with the bad copy first, otherwise a new
-  worker that holds no copy). The target verifies the checksum, fsyncs and renames; only then is the replica `HEALTHY`.
-  Failures back off exponentially and retry; with no live source but a copy on a *dead* worker the task waits for that
-  worker; if no healthy copy exists anywhere the task becomes `UNRECOVERABLE` (reported, never fabricated).
-  Tasks left `IN_PROGRESS` by a crashed controller return to the queue.
+* **Repair runners** claim tasks with `SELECT … FOR UPDATE SKIP LOCKED` and **command a healthy source worker to push
+  the chunk straight to the target** (`POST /internal/chunks/{id}/send` on the source; no chunk bytes pass through the
+  controller). The source verifies the chunk against its own record *and* the controller's checksum, then
+  `PUT … ?repair=true` to the target (repair in place on the worker with the bad copy first, otherwise a new worker
+  that holds no copy). The target verifies the checksum, fsyncs and renames; only after that acknowledgement does the
+  controller mark the replica `HEALTHY`. The source reports *why* a copy failed (`source_missing`, `source_corrupt`,
+  `target_failed`), so a bad source is marked and another is tried, while a bad target is just retried. Failures back
+  off exponentially; with no live source but a copy on a *dead* worker the task waits for that worker; if no healthy
+  copy exists anywhere the task becomes `UNRECOVERABLE` (reported, never fabricated). Tasks left `IN_PROGRESS` by a
+  crashed controller return to the queue.
 * **Inventory reconciliation** (every 30 s, per live worker): compares the worker's chunk list with PostgreSQL.
   Expected-but-absent ⇒ `MISSING` + repair. Files of deleted objects (tombstones) are removed at once. Unknown files are
   *orphans*, removed only after a grace period and only if the metadata still has no replica row for them. The DB rows
@@ -141,7 +166,8 @@ upload; a worker is bounded by its cache budget).
 |---|---|
 | "1 MB" | 1 MiB = 1,048,576 bytes, one setting (`CHUNK_SIZE`) |
 | Language | Python 3.12 (FastAPI, asyncpg, httpx) |
-| Repair transfer | Controller-mediated streaming with bounded buffers (simpler; permitted by the plan) |
+| Upload replication | Chain: the controller sends each chunk to one worker, which forwards it to the second (halves the controller's upload bandwidth). The forwarding worker releases its own transfer slot first, so two workers forwarding to each other cannot deadlock |
+| Repair transfer | Controller-commanded, worker-to-worker: the source pushes straight to the target and the target verifies against the controller's checksum, so the controller never carries chunk data and a bad copy can never become `HEALTHY` |
 | Chunk id | `<object_id>-<index>`: unique, ordered, makes resume and cache-invalidation trivial |
 | Replica placement | Least-loaded first among HEALTHY workers with free space, always two distinct workers |
 | Orphan policy | Never deleted immediately; tombstoned chunks at once, unknown ones after a grace period |
@@ -151,5 +177,5 @@ upload; a worker is bounded by its cache budget).
 
 Single controller (a coordination SPOF by requirement); staged data is lost with the controller's disk; two replicas
 survive one loss per chunk; no authentication; all four workers in this deployment share one physical disk, so free
-space readings are identical; repair data passes through the controller (streamed, bounded); a cache hit hides silent disk
+space readings are identical; workers accept `X-Forward-To` / `/send` commands from anyone on the internal network (no auth); a cache hit hides silent disk
 corruption of that chunk until the next scrub.

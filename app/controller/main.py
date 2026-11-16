@@ -33,8 +33,12 @@ async def lifespan(app: FastAPI):
     app.state.download_gate = Gate(settings.max_concurrent_downloads, "downloads")
     app.state.active_uploads = set()
     app.state.orphans = {}
-    junk = upload.cleanup_staging(settings.staging_dir)
-    log.info("controller ready (chunk_size=%d, partial uploads removed=%d)", settings.chunk_size, junk)
+    try:  # heartbeats kept ageing in PostgreSQL while we were down: find out who is really alive BEFORE judging
+        await health.probe_workers(app.state.pool, app.state.http)
+    except Exception as e:  # never block startup on this; the monitor still applies its normal rule
+        log.warning("startup worker probe failed: %r", e)
+    recovered = await upload.recover_staging(app.state.pool, settings.staging_dir)  # BEFORE the resume loop
+    log.info("controller ready (chunk_size=%d, staging recovery: %s)", settings.chunk_size, recovered)
     resumer = asyncio.create_task(upload.resume_loop(app.state))
     reap = asyncio.create_task(reaper.run(app.state))
     bg = [asyncio.create_task(repair.scanner(app.state)), asyncio.create_task(repair.reconciler(app.state))]

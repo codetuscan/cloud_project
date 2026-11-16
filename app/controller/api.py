@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
 from app.common.config import settings
+import asyncpg
 from app.common.errors import ApiError
 from app.common.responses import JSONResponseNL
 import httpx
@@ -107,90 +108,136 @@ async def upload_object(request: Request):
 
 
 async def _do_upload(request: Request):
+    """Upload in the order "database first":
+
+      1. insert objects (PENDING, placeholders) + uploads (STREAMING)      <- the database knows before any file exists
+      2. stream the body into <id>.uploading (fsynced at the end of the part)
+      3. ONE transaction: real name/size/type/checksum/chunk count/metadata + uploads.state='STAGED'
+                                                                          <- the commit point of the upload
+      4. rename <id>.uploading -> <id>.staged                              <- housekeeping; start-up recovery can finish it
+      5. chunk + replicate -> COMMITTED -> 201
+
+    A complete staged file therefore always has a complete row, and a STREAMING row never promises a file.
+    """
     state = request.app.state
+    pool = state.pool
     ctype = request.headers.get("content-type", "")
     if not ctype.lower().startswith("multipart/form-data"):
         raise ApiError(400, "use multipart/form-data with a 'file' field")
 
     idem = request.headers.get("idempotency-key")
     if idem:
-        existing = await state.pool.fetchrow("SELECT * FROM objects WHERE idempotency_key=$1", idem)
+        existing = await pool.fetchrow(
+            """SELECT o.*, u.state AS upload_state FROM objects o LEFT JOIN uploads u USING (object_id)
+               WHERE o.idempotency_key=$1""", idem)
         if existing is not None:
             if existing["state"] == "COMMITTED":
                 return JSONResponseNL(status_code=200, content=_object_json(existing))
-            raise ApiError(409, "an upload with this Idempotency-Key is still in progress",
-                           extra={"object_id": str(existing["object_id"])})
+            if (existing["state"] == "PENDING" and existing["upload_state"] == "STREAMING"
+                    and existing["object_id"] not in state.active_uploads):
+                # nobody is receiving it (single controller): a dead attempt, e.g. its cleanup failed. Clear it.
+                log.warning("idempotency key reused: dropping dead streaming upload %s", existing["object_id"])
+                await _drop_streaming(state, existing["object_id"])
+            else:
+                raise ApiError(409, "an upload with this Idempotency-Key is still in progress",
+                               extra={"object_id": str(existing["object_id"])})
 
-    if await placement.healthy_count(state.pool) < 2:
+    if await placement.healthy_count(pool) < 2:
         raise ApiError(503, "fewer than 2 healthy workers available; cannot store 2 replicas")
 
     object_id = uuid.uuid4()
     staging = Path(settings.staging_dir)
     part_path = staging / f"{object_id}.uploading"
-    su = None
-    try:
-        su = StreamingUpload(ctype, part_path)
-        async for data in request.stream():
-            await asyncio.to_thread(su.feed, data)
-            if settings.max_upload_bytes and su.size > settings.max_upload_bytes:
-                raise UploadError(f"upload exceeds the maximum of {settings.max_upload_bytes} bytes")
-        await asyncio.to_thread(su.finish)
-        if su.file_parts == 0:
-            raise UploadError("multipart field 'file' is required")
-        if su.size == 0:
-            raise UploadError("empty file; cannot store an object with no data")
-        user_meta = _parse_metadata(bytes(su.meta))
-    except UploadError as e:
-        _discard(su, part_path)
-        raise ApiError(400, str(e))
-    except BaseException:
-        _discard(su, part_path)
-        raise
-
     staged_path = staging / f"{object_id}.staged"
-    await asyncio.to_thread(part_path.replace, staged_path)
-
     chunk_size = settings.chunk_size
-    chunk_count = chunking.chunk_count(su.size, chunk_size)
-    name = (su.filename or "unnamed")[:255]
+
+    # 1. tell the database first. Name/size/metadata are not known yet: placeholders, filled in at step 3.
     try:
-        async with state.pool.acquire() as c:
+        async with pool.acquire() as c:
             async with c.transaction():
                 await c.execute(
-                    """INSERT INTO objects (object_id,name,size,content_type,checksum,chunk_count,chunk_size,
-                                            state,user_metadata,idempotency_key)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING',$8,$9)""",
-                    object_id, name, su.size, su.content_type, su.checksum, chunk_count, chunk_size,
-                    user_meta, idem)
-                await c.execute("INSERT INTO uploads (object_id, staged_path, state) VALUES ($1,$2,'STAGED')",
+                    """INSERT INTO objects (object_id, name, chunk_size, state, idempotency_key)
+                       VALUES ($1, '(upload in progress)', $2, 'PENDING', $3)""", object_id, chunk_size, idem)
+                await c.execute("INSERT INTO uploads (object_id, staged_path, state) VALUES ($1,$2,'STREAMING')",
                                 object_id, str(staged_path))
-    except BaseException:
-        staged_path.unlink(missing_ok=True)  # no uploads row exists, so nothing could ever resume/clean this file
-        raise
+    except asyncpg.UniqueViolationError:  # a simultaneous request with the same Idempotency-Key won the insert
+        raise ApiError(409, "an upload with this Idempotency-Key is still in progress")
 
-    state.active_uploads.add(object_id)
+    state.active_uploads.add(object_id)  # from now on the reaper and the resume loop leave it alone
     try:
-        await upload.commit_upload(state, object_id)
-    except upload.UploadUnavailable as e:
-        metrics.inc("uploads_pending_503")
-        log.warning("upload %s not committed yet: %s", object_id, e)
-        raise ApiError(503, "not enough healthy workers to store 2 replicas right now; the upload is "
-                            "kept in staging and will be completed automatically when workers recover",
-                       code="storage_unavailable",
-                       extra={"object_id": str(object_id), "state": "PENDING"})
+        su = None
+        try:
+            # 2. receive the bytes
+            su = StreamingUpload(ctype, part_path)
+            async for data in request.stream():
+                await asyncio.to_thread(su.feed, data)
+                if settings.max_upload_bytes and su.size > settings.max_upload_bytes:
+                    raise UploadError(f"upload exceeds the maximum of {settings.max_upload_bytes} bytes")
+            await asyncio.to_thread(su.finish)  # the file part was flushed + fsynced when it ended
+            if su.file_parts == 0:
+                raise UploadError("multipart field 'file' is required")
+            if su.size == 0:
+                raise UploadError("empty file; cannot store an object with no data")
+            user_meta = _parse_metadata(bytes(su.meta))
+            name = (su.filename or "unnamed")[:255]
+
+            # 3. the commit point: every detail + STAGED, atomically. After this the controller owns the upload.
+            async with pool.acquire() as c:
+                async with c.transaction():
+                    await c.execute(
+                        """UPDATE objects SET name=$2, size=$3, content_type=$4, checksum=$5, chunk_count=$6,
+                                              user_metadata=$7, updated_at=now()
+                           WHERE object_id=$1 AND state='PENDING'""",
+                        object_id, name, su.size, su.content_type, su.checksum,
+                        chunking.chunk_count(su.size, chunk_size), user_meta)
+                    await c.execute("UPDATE uploads SET state='STAGED', updated_at=now() WHERE object_id=$1",
+                                    object_id)
+        except UploadError as e:
+            await _drop_streaming(state, object_id, su, part_path)
+            raise ApiError(400, str(e))
+        except BaseException:  # includes a client disconnect (task cancelled) and a database failure at step 3
+            await _drop_streaming(state, object_id, su, part_path)
+            raise
+
+        # 4. housekeeping only: a crash here leaves STAGED + a complete .uploading, which start-up recovery renames
+        await asyncio.to_thread(part_path.replace, staged_path)
+
+        # 5. chunk + replicate
+        try:
+            await upload.commit_upload(state, object_id)
+        except upload.UploadUnavailable as e:
+            metrics.inc("uploads_pending_503")
+            log.warning("upload %s not committed yet: %s", object_id, e)
+            raise ApiError(503, "not enough healthy workers to store 2 replicas right now; the upload is "
+                                "kept in staging and will be completed automatically when workers recover",
+                           code="storage_unavailable",
+                           extra={"object_id": str(object_id), "state": "PENDING"})
     finally:
         state.active_uploads.discard(object_id)
 
     metrics.inc("uploads_committed")
     metrics.inc("upload_bytes", su.size)
-    obj = await state.pool.fetchrow("SELECT * FROM objects WHERE object_id=$1", object_id)
+    obj = await pool.fetchrow("SELECT * FROM objects WHERE object_id=$1", object_id)
     return JSONResponseNL(status_code=201, content=_object_json(obj))
 
 
-def _discard(su, path: Path) -> None:
+async def _drop_streaming(state, object_id, su=None, part_path: Path | None = None) -> None:
+    """Forget an upload that never reached STAGED: close + delete its partial file and its rows (uploads cascades).
+
+    Runs on errors and on client disconnects, so the database part is shielded from a second cancellation. If it
+    still fails, the dead-row rule on Idempotency-Key reuse and the start-up recovery clean it up later.
+    """
     if su is not None:
         su.close()
-    path.unlink(missing_ok=True)
+    staging = Path(settings.staging_dir)
+    for p in {part_path or staging / f"{object_id}.uploading", staging / f"{object_id}.staged"}:
+        p.unlink(missing_ok=True)
+    try:
+        await asyncio.shield(state.pool.execute(
+            """DELETE FROM objects WHERE object_id=$1 AND state='PENDING'
+                 AND EXISTS (SELECT 1 FROM uploads u WHERE u.object_id=$1 AND u.state='STREAMING')""", object_id))
+    except (Exception, asyncio.CancelledError) as e:
+        log.warning("could not remove the rows of aborted upload %s (recovery will): %r", object_id, e)
 
 
 @router.get("/api/v1/objects/{object_id}/metadata")
@@ -203,7 +250,8 @@ async def get_metadata(object_id: str, request: Request):
     body = _object_json(m["obj"])
     body["chunks"] = [
         {"index": c["chunk_index"], "chunk_id": c["chunk_id"], "size": c["size"], "checksum": c["checksum"],
-         "replicas": [{"worker_id": r["worker_id"], "state": r["state"]} for r in c["replicas"]]}
+         "replicas": [{"worker_id": r["worker_id"], "state": r["state"], "worker_state": r["wstate"]}
+                      for r in c["replicas"]]}
         for c in m["chunks"]]
     return body
 

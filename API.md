@@ -76,11 +76,15 @@ System metadata, custom metadata, and the chunk manifest with replica locations:
   "created_at": "…", "last_modified": "…", "user_metadata": {"owner": "alice"},
   "chunks": [
     {"index": 0, "chunk_id": "<object_id>-000000", "size": 1048576, "checksum": "sha256:…",
-     "replicas": [{"worker_id": "worker1", "state": "HEALTHY"}, {"worker_id": "worker3", "state": "HEALTHY"}]}
+     "replicas": [{"worker_id": "worker1", "state": "HEALTHY", "worker_state": "HEALTHY"},
+                  {"worker_id": "worker3", "state": "HEALTHY", "worker_state": "HEALTHY"}]}
   ]
 }
 ```
-Replica `state`: `HEALTHY`, `CORRUPT`, `MISSING`, `PENDING`, `DELETING`.
+Replica `state`: `HEALTHY`, `CORRUPT`, `MISSING`, `PENDING`, `DELETING` — what the last check found about the stored
+copy. `worker_state` (`HEALTHY`, `DEGRADED`, `DEAD`) is whether that worker is reachable now. A copy is usable
+only when `state` is `HEALTHY` **and** `worker_state` is not `DEAD`; a copy on a dead worker keeps its `HEALTHY`
+state so repair can wait for the worker instead of declaring data lost.
 
 ### `PATCH /api/v1/objects/{object_id}/metadata` — 200
 
@@ -132,7 +136,8 @@ Oldest first. `limit` is 1–1000 (default 100). `next_cursor` is `null` on the 
 
 | Method | Path | Purpose |
 |---|---|---|
-| `PUT` | `/internal/chunks/{chunk_id}` | Store a chunk. Header `X-Chunk-Checksum: sha256:<hex>` is required. The body is written to a temp file, hashed, `fsync`ed and atomically renamed; acknowledged only after that. `201` created, `200` identical chunk already stored (idempotent), `409 chunk_conflict` same id with different content, `400 checksum_mismatch`. `?repair=true` (controller only) replaces a damaged copy after verifying against the controller's checksum. |
+| `PUT` | `/internal/chunks/{chunk_id}` | Store a chunk. Header `X-Chunk-Checksum: sha256:<hex>` is required. The body is written to a temp file, hashed, `fsync`ed and atomically renamed; acknowledged only after that. `201` created, `200` identical chunk already stored (idempotent), `409 chunk_conflict` same id with different content, `400 checksum_mismatch`. `?repair=true` (controller only) replaces a damaged copy after verifying against the controller's checksum. **Chain replication:** with headers `X-Forward-To: http://<next worker>:9000` and `X-Forward-Worker-Id`, the worker stores the chunk, forwards it to that worker, and replies with `replicas: [{"worker_id", "ok", "error"?}, …]` (one entry per copy). The local copy is acknowledged even if the forward failed (`ok: false`). Not allowed together with `repair=true` (400). |
+| `POST` | `/internal/chunks/{chunk_id}/send` | Controller command: push this worker's copy straight to another worker. Body `{target_address, checksum, size}`. The chunk is read from disk, verified against the worker's own record **and** the controller's checksum, then sent with `PUT …?repair=true`. Always `200` with `{"ok": true}` or `{"ok": false, "reason": "source_missing" \| "source_corrupt" \| "target_failed", "detail"}`. |
 | `GET` | `/internal/chunks/{chunk_id}` | Read a chunk (verified against its stored checksum; `500 chunk_corrupt` instead of bad bytes; `404` if missing). `X-Cache: HIT\|MISS` header. |
 | `DELETE` | `/internal/chunks/{chunk_id}` | Delete a chunk (204, also if already gone) |
 | `GET` | `/internal/workers/{worker_id}/chunks` | Inventory: `{chunks: [{chunk_id, size, checksum}]}` |

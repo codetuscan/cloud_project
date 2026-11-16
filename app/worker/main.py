@@ -12,6 +12,7 @@ from app.common.requestid import RequestIdMiddleware
 from app.common.logging import setup_logging
 from app.common.responses import JSONResponseNL
 from app.worker import agent, disk, scrub
+from app.worker import api
 from app.worker.api import router
 
 log = logging.getLogger("worker")
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     for t in tasks:
         t.cancel()
+    await api.close_client()
 
 
 app = FastAPI(title="Object Store Worker", lifespan=lifespan, default_response_class=JSONResponseNL)

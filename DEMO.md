@@ -38,8 +38,8 @@ docker compose up -d --build             # or ./scripts/clean_start.sh for a fre
   ✔ every chunk has 2 healthy replicas on LIVE workers again (after ~2s)
     controller | WARNING controller.health: worker worker2 missed heartbeats for >15s -> DEAD
     controller | WARNING controller.repair: 2 chunk(s) below 2 healthy replicas; repair queued
-    controller | INFO    controller.repair: repaired …-000001: copied from worker1 to worker3 (checksum verified, fsynced)
-    controller | INFO    controller.repair: repaired …-000003: copied from worker3 to worker1 (checksum verified, fsynced)
+    controller | INFO    controller.repair: repaired …-000001: copied directly from worker1 to worker3 (checksum verified, fsynced)
+    controller | INFO    controller.repair: repaired …-000003: copied directly from worker3 to worker1 (checksum verified, fsynced)
     chunk 1 -> worker1, worker2(DEAD), worker3        <- worker2's copy is no longer counted
     chunk 3 -> worker1, worker2(DEAD), worker3
 
@@ -61,7 +61,7 @@ docker compose up -d --build             # or ./scripts/clean_start.sh for a fre
        expected=sha256:fe886510b785…
        actual  =sha256:412eae9a09eb…
 ▶ 4) repair task: reason=scrub: CORRUPT…  source=worker3  target=worker2  state=DONE
-     controller | repaired …-000002: copied from worker3 to worker2 (checksum verified, fsynced)
+     controller | repaired …-000002: copied directly from worker3 to worker2 (checksum verified, fsynced)
 ▶ 5) worker2's file matches the expected checksum again; two healthy replicas on different workers
 ▶ 8) sha256 of the downloaded object equals the original
 ```

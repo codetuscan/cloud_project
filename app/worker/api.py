@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import logging
 
+import httpx
 from fastapi import APIRouter, Request, Response
+from pydantic import BaseModel, Field
 
 from app.common import checksum as cs
 from app.common import metrics
@@ -41,6 +43,16 @@ async def put_chunk(chunk_id: str, request: Request):
     # repair=true: controller-directed replacement of a bad/missing replica. The body is still
     # verified against the controller-supplied checksum before it replaces anything.
     repair = request.query_params.get("repair") == "true"
+
+    # Chain replication: the controller sends the chunk to ONE worker and names the next one. This worker
+    # stores it, forwards it, and acknowledges only when it knows the outcome of both copies.
+    forward = None
+    fwd_addr = request.headers.get("x-forward-to")
+    if fwd_addr:
+        if repair or not fwd_addr.startswith("http://"):
+            raise ApiError(400, "X-Forward-To must be an http:// address and cannot be combined with repair=true")
+        forward = (request.headers.get("x-forward-worker-id", ""), fwd_addr.rstrip("/"))
+
     async with _transfers():
         existing = None if repair else await asyncio.to_thread(disk.stored_checksum, chunk_id)
         if existing is not None and existing != expected:
@@ -51,7 +63,8 @@ async def put_chunk(chunk_id: str, request: Request):
         if repair:
             wcache.chunk_cache.invalidate(chunk_id)
         # write-through: keep the bytes (<= one chunk) so the cache can be warmed AFTER the durable write
-        keep: list[bytes] | None = [] if (writer is not None and wcache.chunk_cache.enabled) else None
+        # (the same bytes are forwarded to the next worker when chain replication was requested)
+        keep: list[bytes] | None = [] if (forward or (writer is not None and wcache.chunk_cache.enabled)) else None
         total = 0
         try:
             hasher_h = None
@@ -63,10 +76,10 @@ async def put_chunk(chunk_id: str, request: Request):
                     raise ApiError(400, f"chunk larger than {settings.chunk_size} bytes")
                 if writer is not None:
                     await asyncio.to_thread(writer.write, part)
-                    if keep is not None:
-                        keep.append(part)
                 else:
                     hasher_h.update(part)
+                if keep is not None:
+                    keep.append(part)
             actual = writer.checksum if writer else cs.fmt(hasher_h.hexdigest())
             if actual != expected:
                 metrics.inc("chunk_put_checksum_mismatches")
@@ -74,7 +87,7 @@ async def put_chunk(chunk_id: str, request: Request):
                                "checksum_mismatch")
             if writer is not None:
                 await asyncio.to_thread(writer.commit)
-                if keep is not None:  # durable + verified: now it is safe to cache
+                if keep is not None and wcache.chunk_cache.enabled:  # durable + verified: now safe to cache
                     wcache.chunk_cache.put(chunk_id, (b"".join(keep), expected), size=total)
         except BaseException:
             if writer is not None:
@@ -83,9 +96,103 @@ async def put_chunk(chunk_id: str, request: Request):
 
     metrics.inc("chunk_puts")
     metrics.inc("chunk_put_bytes", total)
+    body = {"chunk_id": chunk_id, "size": total, "checksum": expected}
+    if forward is not None:
+        # our transfer slot is released first, so two workers forwarding to each other can never deadlock
+        body["replicas"] = [{"worker_id": settings.worker_id, "ok": True},
+                            await _forward(chunk_id, expected, b"".join(keep), forward)]
     status = 200 if existing else 201
-    return JSONResponseNL(status_code=status,
-                          content={"chunk_id": chunk_id, "size": total, "checksum": expected})
+    return JSONResponseNL(status_code=status, content=body)
+
+
+_client: httpx.AsyncClient | None = None
+FORWARD_ATTEMPTS = 2
+
+
+def _http() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0))
+    return _client
+
+
+async def close_client() -> None:
+    if _client is not None:
+        await _client.aclose()
+
+
+async def _forward(chunk_id: str, checksum: str, data: bytes, target: tuple[str, str]) -> dict:
+    """Send the chunk we just stored to the next worker. Never raises: the outcome goes back to the controller."""
+    wid, addr = target
+    last = "unknown error"
+    for attempt in range(FORWARD_ATTEMPTS):
+        try:
+            r = await _http().put(f"{addr}/internal/chunks/{chunk_id}", content=data,
+                                  headers={"X-Chunk-Checksum": checksum, "Content-Type": "application/octet-stream"})
+            if r.status_code in (200, 201):
+                metrics.inc("chunk_forwards_ok")
+                return {"worker_id": wid, "ok": True}
+            last = f"{r.status_code} {r.text.strip()[:200]}"
+            if r.status_code in (400, 409):  # deterministic rejection: retrying cannot help
+                break
+        except httpx.HTTPError as e:
+            last = repr(e)
+        await asyncio.sleep(0.2 * (2 ** attempt))
+    metrics.inc("chunk_forwards_failed")
+    log.warning("forward of %s to %s failed: %s", chunk_id, wid or addr, last)
+    return {"worker_id": wid, "ok": False, "error": last}
+
+
+class SendCommand(BaseModel):
+    target_address: str = Field(min_length=8, max_length=256)
+    checksum: str  # the controller's authoritative checksum for this chunk
+    size: int = Field(ge=1)
+
+
+@router.post("/internal/chunks/{chunk_id}/send")
+async def send_chunk(chunk_id: str, cmd: SendCommand):
+    """Controller-directed copy: push one of OUR chunks straight to another worker (repair / re-replication).
+
+    The bytes never pass through the controller. We verify them against both our own record and the
+    controller's checksum before sending; the target verifies again before it acknowledges. Always answers 200
+    with {"ok": bool, "reason"?} so the controller can tell a bad source from a bad target.
+    """
+    _check_id(chunk_id)
+    if not cs.valid(cmd.checksum) or not cmd.target_address.startswith("http://"):
+        raise ApiError(400, "need a valid sha256 checksum and an http:// target_address")
+
+    def fail(reason: str, detail: str = ""):
+        metrics.inc("chunk_sends_failed")
+        log.warning("send of %s to %s failed: %s %s", chunk_id, cmd.target_address, reason, detail)
+        return JSONResponseNL(content={"ok": False, "reason": reason, "detail": detail})
+
+    async with _transfers():  # released before the push so two workers sending to each other cannot deadlock
+        try:
+            data, _ = await asyncio.to_thread(disk.read_verified, chunk_id)  # disk, never the cache: repairs must see the truth
+        except disk.ChunkMissing:
+            wcache.chunk_cache.invalidate(chunk_id)
+            return fail("source_missing")
+        except disk.ChunkCorrupt as e:
+            wcache.chunk_cache.invalidate(chunk_id)
+            return fail("source_corrupt", str(e))
+    if len(data) != cmd.size or cs.sha256_bytes(data) != cmd.checksum:
+        wcache.chunk_cache.invalidate(chunk_id)
+        return fail("source_corrupt", "differs from the controller's checksum")
+
+    last = "unknown error"
+    for attempt in range(FORWARD_ATTEMPTS):
+        try:
+            r = await _http().put(f"{cmd.target_address.rstrip('/')}/internal/chunks/{chunk_id}?repair=true",
+                                  content=data, headers={"X-Chunk-Checksum": cmd.checksum,
+                                                         "Content-Type": "application/octet-stream"})
+            if r.status_code in (200, 201):
+                metrics.inc("chunk_sends_ok")
+                return JSONResponseNL(content={"ok": True})
+            last = f"{r.status_code} {r.text.strip()[:200]}"
+        except httpx.HTTPError as e:
+            last = repr(e)
+        await asyncio.sleep(0.2 * (2 ** attempt))
+    return fail("target_failed", last)
 
 
 @router.get("/internal/chunks/{chunk_id}")

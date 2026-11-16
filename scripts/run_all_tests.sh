@@ -12,7 +12,8 @@ for t in "unit tests:./scripts/run_unit_tests.sh" \
          "phase 7 scrubbers:./scripts/phase7_test.sh" \
          "phase 8 caching:./scripts/phase8_test.sh" \
          "phase 9 concurrency + memory:./scripts/phase9_test.sh" \
-         "phase 10 restarts + persistence:./scripts/phase10_persistence_test.sh"; do
+         "phase 10 restarts + persistence:./scripts/phase10_persistence_test.sh" \
+         "phase 11 upload crash safety:./scripts/phase11_upload_crash_test.sh"; do
   LAST=${t%%:*}; run "$LAST" ${t#*:}
 done
 echo; echo "================ SUMMARY"

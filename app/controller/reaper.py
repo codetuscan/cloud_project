@@ -96,6 +96,7 @@ async def _abort_abandoned(state) -> None:
         if ok:
             if r["staged_path"]:
                 Path(r["staged_path"]).unlink(missing_ok=True)
+                Path(r["staged_path"]).with_suffix(".uploading").unlink(missing_ok=True)  # a dead STREAMING attempt
             log.warning("aborted abandoned upload %s", r["object_id"])
 
 
