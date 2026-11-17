@@ -69,6 +69,10 @@ services:
       ORPHAN_GRACE_SECONDS: ${ORPHAN_GRACE_SECONDS:-120}
       UPLOAD_ABANDON_SECONDS: ${UPLOAD_ABANDON_SECONDS:-3600}
       TOMBSTONE_RETENTION_SECONDS: ${TOMBSTONE_RETENTION_SECONDS:-86400}
+      REBALANCE_ENABLED: ${REBALANCE_ENABLED:-true}
+      REBALANCE_INTERVAL: ${REBALANCE_INTERVAL:-15}
+      REBALANCE_TOLERANCE: ${REBALANCE_TOLERANCE:-2}
+      REBALANCE_BATCH: ${REBALANCE_BATCH:-16}
       MAX_CONCURRENT_TRANSFERS: ${MAX_CONCURRENT_TRANSFERS:-8}
     volumes:
       - staging:/staging
@@ -101,6 +105,51 @@ services:
     container_name: worker4
     environment: {<<: *worker-env, WORKER_ID: worker4, WORKER_ADDRESS: "http://worker4:9000"}
     volumes: ["worker4_data:/data"]
+  # Scale-out demo: not started by `docker compose up`; add it with `docker compose up -d worker5`.
+  # It registers like the others and the rebalancer moves existing replicas onto it.
+  worker5:
+    <<: *worker
+    container_name: worker5
+    profiles: [scaleout]
+    environment: {<<: *worker-env, WORKER_ID: worker5, WORKER_ADDRESS: "http://worker5:9000"}
+    volumes: ["worker5_data:/data"]
+
+  # ---- monitoring (optional: the object store does not depend on these) ----
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks: [internal]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: grafana
+    restart: unless-stopped
+    depends_on: [prometheus]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"          # open the dashboard without logging in (read-only)
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/objstore.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    networks: [internal]
 
 networks:
   internal:
@@ -113,3 +162,5 @@ volumes:
   worker2_data:
   worker3_data:
   worker4_data:
+  worker5_data:
+  promdata:

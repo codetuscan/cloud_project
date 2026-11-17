@@ -71,7 +71,7 @@ async def heartbeat(info: WorkerInfo, request: Request):
 async def list_workers(request: Request):
     async with request.app.state.pool.acquire() as c:
         rows = await c.fetch(
-            """SELECT worker_id, address, state, capacity_bytes, used_bytes,
+            """SELECT worker_id, address, state, draining, capacity_bytes, used_bytes,
                       EXTRACT(EPOCH FROM (now() - last_heartbeat)) AS heartbeat_age_seconds
                FROM workers ORDER BY worker_id""")
     return {"workers": [
@@ -170,3 +170,62 @@ async def expected_checksum(chunk_id: str, request: Request):
     if row is None:
         raise ApiError(404, "unknown chunk")
     return {"chunk_id": chunk_id, "checksum": row["checksum"], "size": row["size"]}
+
+
+# ------------------------------------------------------------------ scale-in: drain, then forget
+@router.post("/internal/workers/{worker_id}/drain")
+async def drain(worker_id: str, request: Request):
+    """Stop placing data on the worker and let the rebalancer move its replicas elsewhere (reversible)."""
+    pool = request.app.state.pool
+    row = await pool.fetchrow("UPDATE workers SET draining=true WHERE worker_id=$1 RETURNING state", worker_id)
+    if row is None:
+        raise ApiError(404, "unknown worker", "not_found")
+    left = await pool.fetchval(
+        "SELECT count(*) FROM replicas WHERE worker_id=$1 AND state IN ('HEALTHY','PENDING')", worker_id)
+    log.warning("worker %s is draining: %d replica(s) to move", worker_id, left)
+    return {"worker_id": worker_id, "draining": True, "state": row["state"], "replicas_left": left}
+
+
+@router.post("/internal/workers/{worker_id}/undrain")
+async def undrain(worker_id: str, request: Request):
+    row = await request.app.state.pool.fetchrow(
+        "UPDATE workers SET draining=false WHERE worker_id=$1 RETURNING state", worker_id)
+    if row is None:
+        raise ApiError(404, "unknown worker", "not_found")
+    log.info("worker %s is no longer draining", worker_id)
+    return {"worker_id": worker_id, "draining": False, "state": row["state"]}
+
+
+@router.delete("/internal/workers/{worker_id}")
+async def forget(worker_id: str, request: Request):
+    """Remove a DEAD worker from the cluster for good.
+
+    Refused while the worker is alive (it would simply register again) and while it holds the only healthy copy
+    of any chunk. Copies it still has on its own disk are forgotten; if it ever returns, it registers as a new,
+    empty worker and those files are removed as orphans.
+    """
+    pool = request.app.state.pool
+    async with pool.acquire() as c:
+        async with c.transaction():
+            w = await c.fetchrow("SELECT state FROM workers WHERE worker_id=$1 FOR UPDATE", worker_id)
+            if w is None:
+                raise ApiError(404, "unknown worker", "not_found")
+            if w["state"] != "DEAD":
+                raise ApiError(409, f"worker is {w['state']}: stop it first (drain it before, to move its data "
+                                    "off without any under-replication)", "worker_alive")
+            at_risk = await c.fetchval(
+                """SELECT count(*) FROM replicas r WHERE r.worker_id=$1 AND r.state='HEALTHY'
+                   AND (SELECT count(*) FROM replicas x JOIN workers v USING (worker_id)
+                        WHERE x.chunk_id=r.chunk_id AND x.worker_id<>$1 AND x.state='HEALTHY'
+                          AND v.state<>'DEAD') < 2""", worker_id)
+            if at_risk:
+                raise ApiError(409, f"{at_risk} chunk(s) do not yet have 2 healthy copies on other workers; "
+                                    "wait for repair to finish", "would_lose_redundancy")
+            dropped = await c.fetchval("SELECT count(*) FROM replicas WHERE worker_id=$1", worker_id)
+            await c.execute("DELETE FROM replicas WHERE worker_id=$1", worker_id)
+            await c.execute("DELETE FROM tombstones WHERE worker_id=$1", worker_id)
+            await c.execute("DELETE FROM worker_scrub_state WHERE worker_id=$1", worker_id)
+            await c.execute("DELETE FROM workers WHERE worker_id=$1", worker_id)
+    meta_cache.invalidate_all()
+    log.warning("worker %s removed from the cluster (%d replica record(s) dropped)", worker_id, dropped)
+    return {"worker_id": worker_id, "removed": True, "replica_records_dropped": dropped}

@@ -117,8 +117,9 @@ Oldest first. `limit` is 1–1000 (default 100). `next_cursor` is `null` on the 
 | Endpoint | Purpose |
 |---|---|
 | `GET /healthz` | Liveness |
-| `GET /internal/status[?detail=true]` | Cluster view: workers (state, heartbeat age, free/used, last scrub), object/chunk counts, replica counts by state, under-replicated chunks, repair tasks by state, cache and concurrency stats; `detail=true` adds each live worker's own `/internal/status` |
+| `GET /internal/status[?detail=true]` | Cluster view: workers (state, draining, heartbeat age, free/used, last scrub), object/chunk counts, replica counts by state, under-replicated chunks, repair tasks by state, cache and concurrency stats. `rebalance` holds `{enabled, state` (`balanced`, `moving N replica(s)`, `waiting: …`), `spread, loads, draining, moves_last_round, tolerance}`. `detail=true` adds each live worker's own `/internal/status` |
 | `GET /internal/metrics` | Counters (uploads, downloads, repairs, scrub reports, fallbacks, …), in-flight/peak/rejected per concurrency gate, metadata-cache statistics |
+| `GET /metrics` | The same counters plus cluster state, in **Prometheus text format** (scraped every 5 s). All names start with `objstore_`. Process counters: `objstore_<event>_total` (e.g. `uploads_committed`, `replicas_marked_corrupt`, `repairs_done`); histograms `objstore_upload_duration_seconds`, `objstore_download_duration_seconds`, `objstore_repair_time_to_heal_seconds`. Cluster gauges, computed from PostgreSQL at scrape time: `objstore_workers{state}`, `objstore_worker_state{worker_id,state}`, `objstore_worker_alive{worker_id}`, `objstore_worker_heartbeat_age_seconds{worker_id}`, `objstore_objects{state}`, `objstore_stored_bytes`, `objstore_committed_chunks`, `objstore_under_replicated_chunks`, `objstore_unavailable_chunks`, `objstore_replicas{state}`, `objstore_worker_replicas{worker_id,state}`, `objstore_repair_tasks{state}`, `objstore_repair_oldest_active_task_age_seconds`, `objstore_database_up`, `objstore_worker_draining{worker_id}`. Rebalancer: `objstore_rebalance_moves_total`, `objstore_rebalance_move_failures_total`, `objstore_rebalance_replica_spread`, `objstore_rebalance_moving`. Also gates (`objstore_gate_*{gate}`) and the metadata cache (`objstore_cache_*{cache="metadata"}`). If PostgreSQL is down, `objstore_database_up` is 0 and the process metrics are still served. |
 | `GET /internal/cache/stats`, `POST /internal/cache/clear` | Metadata cache hit/miss/eviction/expiration/invalidation statistics; clear it (demo/testing) |
 
 ## Worker-facing endpoints (controller, internal network)
@@ -131,6 +132,9 @@ Oldest first. `limit` is 1–1000 (default 100). `next_cursor` is `null` on the 
 | `POST` | `/internal/workers/scrub-results` | One scrubber finding: `{worker_id, chunk_id, status: HEALTHY\|CORRUPT\|MISSING\|UNREADABLE, expected_checksum, actual_checksum, checked_at}`. Idempotent; response `{"status":"recorded","action":"marked_corrupt"\|"marked_missing"\|"ignored"\|"verified", "reason"?}`. Stale reports, reports for unknown replicas, and CORRUPT reports whose bytes match the authoritative checksum are ignored. |
 | `POST` | `/internal/workers/scrub-summary` | Totals of a finished scrub pass (shown in status) |
 | `GET` | `/internal/chunks/{chunk_id}/expected` | Authoritative checksum of a chunk |
+| `POST` | `/internal/workers/{worker_id}/drain` | Start emptying a worker before removing it. Placement skips it from now on; the rebalancer moves its replicas to other workers. Returns `{worker_id, draining: true, state, replicas_left}`. `404` if unknown |
+| `POST` | `/internal/workers/{worker_id}/undrain` | Cancel draining |
+| `DELETE` | `/internal/workers/{worker_id}` | Remove a worker from the cluster. Only allowed once it is `DEAD` (`409 worker_alive` otherwise). Refused with `409 would_lose_redundancy` if any of its chunks lacks 2 healthy copies elsewhere. Returns `{worker_id, removed: true, replica_records_dropped}` |
 
 ## Worker endpoints (each worker, port 9000, internal network only)
 
@@ -144,4 +148,5 @@ Oldest first. `limit` is 1–1000 (default 100). `next_cursor` is `null` on the 
 | `POST` | `/internal/scrub/trigger` | Start a scrub pass now (202) |
 | `GET` | `/internal/scrub/status` | Progress and counters of the scrubber, durable report-queue depth |
 | `GET` | `/internal/status`, `/internal/metrics` | Worker health, disk, cache, scrub, counters |
+| `GET` | `/metrics` | Prometheus text format: chunk I/O counters (`objstore_chunk_puts_total`, `…_gets_total`, `…_get_corrupt_total`, `…_forwards_ok_total`, `…_sends_ok_total`, …), cumulative scrub counters (`objstore_scrub_bytes_checked_total`, `objstore_scrub_findings_{corrupt,missing,unreadable}_total`), `objstore_chunks_on_disk`, disk bytes, scrub state of the last pass, `objstore_scrub_report_queue_depth`, transfer gate, chunk cache. No `worker_id` label is emitted; Prometheus adds it per target. |
 | `GET` | `/internal/cache/stats`, `POST /internal/cache/clear` | Chunk-cache statistics (hits, misses, evictions, bytes served from cache, disk reads); clear RAM cache |

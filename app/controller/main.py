@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
 
 from app.common.config import settings
 from app.common import metrics
@@ -14,7 +15,8 @@ from app.common.gate import Gate
 from app.common.requestid import RequestIdMiddleware
 from app.common.logging import setup_logging
 from app.common.responses import JSONResponseNL
-from app.controller import health, meta_cache, reaper, repair, store, upload
+from app.common.prom import CONTENT_TYPE as PROM_CONTENT_TYPE
+from app.controller import health, meta_cache, prom_metrics, reaper, rebalance, repair, store, upload
 from app.controller.api import router as api_router
 from app.controller.internal_api import router as internal_router
 
@@ -24,6 +26,7 @@ log = logging.getLogger("controller")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging("controller")
+    prom_metrics.declare()  # every known counter exists at 0 from the first scrape
     Path(settings.staging_dir).mkdir(parents=True, exist_ok=True)
     app.state.pool = await store.connect(settings.database_url)
     await store.migrate(app.state.pool)
@@ -43,6 +46,7 @@ async def lifespan(app: FastAPI):
     reap = asyncio.create_task(reaper.run(app.state))
     bg = [asyncio.create_task(repair.scanner(app.state)), asyncio.create_task(repair.reconciler(app.state))]
     bg += [asyncio.create_task(repair.runner(app.state, i)) for i in range(settings.repair_concurrency)]
+    bg.append(asyncio.create_task(rebalance.loop(app.state)))
     monitor = asyncio.create_task(
         health.monitor(app.state.pool, settings.heartbeat_timeout, max(1.0, settings.heartbeat_interval / 2)))
     yield
@@ -73,7 +77,7 @@ async def status(detail: bool = False):
     async with pool.acquire() as c:
         await c.fetchval("SELECT 1")
         workers = await c.fetch(
-            """SELECT w.worker_id, w.state, w.capacity_bytes, w.used_bytes,
+            """SELECT w.worker_id, w.state, w.draining, w.capacity_bytes, w.used_bytes,
                       round(EXTRACT(EPOCH FROM (now()-w.last_heartbeat))::numeric,1) AS heartbeat_age_seconds,
                       s.last_scrub_at, s.chunks_checked, s.bytes_checked, s.corrupt_found, s.missing_found,
                       s.unreadable_found, s.duration_seconds, s.passes_completed
@@ -103,7 +107,8 @@ async def status(detail: bool = False):
         "active_uploads": len(app.state.active_uploads),
         **({"worker_detail": worker_detail} if worker_detail is not None else {}),
         "workers": [{
-            "worker_id": w["worker_id"], "state": w["state"], "capacity_bytes": w["capacity_bytes"],
+            "worker_id": w["worker_id"], "state": w["state"], "draining": w["draining"],
+            "capacity_bytes": w["capacity_bytes"],
             "used_bytes": w["used_bytes"], "free_bytes": w["capacity_bytes"] - w["used_bytes"],
             "heartbeat_age_seconds": float(w["heartbeat_age_seconds"]),
             "last_scrub": None if w["last_scrub_at"] is None else {
@@ -117,6 +122,7 @@ async def status(detail: bool = False):
         "replicas": {r["state"]: r["n"] for r in reps},
         "under_replicated_chunks": under,
         "repair_tasks": {r["state"]: r["n"] for r in tasks},
+        "rebalance": {**rebalance.status, "tolerance": settings.rebalance_tolerance},
     }
 
 
@@ -129,6 +135,12 @@ async def get_metrics():
         "active_uploads": len(app.state.active_uploads),
         "repair_runners": settings.repair_concurrency,
     }
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics():
+    """Prometheus scrape endpoint (text format). /internal/metrics stays the JSON view."""
+    return PlainTextResponse(await prom_metrics.render(app.state), media_type=PROM_CONTENT_TYPE)
 
 
 if __name__ == "__main__":

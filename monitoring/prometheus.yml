@@ -1,0 +1,41 @@
+# Prometheus scrapes GET /metrics on the controller and on every worker over the internal Docker network.
+# A stopped worker container simply shows up as up{job="workers"} == 0 (its name no longer resolves).
+global:
+  scrape_interval: 5s      # same order as the heartbeat interval, so a failure is visible within seconds
+  scrape_timeout: 4s       # must not exceed scrape_interval
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: controller
+    static_configs:
+      - targets: ["controller:8080"]
+
+  - job_name: workers
+    # worker_id is attached here (not emitted by the worker) so it matches the controller's worker_id label
+    static_configs:
+      - targets: ["worker1:9000"]
+        labels: {worker_id: worker1}
+      - targets: ["worker2:9000"]
+        labels: {worker_id: worker2}
+      - targets: ["worker3:9000"]
+        labels: {worker_id: worker3}
+      - targets: ["worker4:9000"]
+        labels: {worker_id: worker4}
+
+  # Optional worker5 (scale-out demo, `docker compose up -d worker5`): discovered by DNS so it is only scraped while
+  # the container exists; its series join job="workers" like the others.
+  - job_name: workers_scaleout
+    dns_sd_configs:
+      - names: [worker5]
+        type: A
+        port: 9000
+        refresh_interval: 10s
+    relabel_configs:
+      - target_label: job
+        replacement: workers
+      - target_label: worker_id
+        replacement: worker5
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

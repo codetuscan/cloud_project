@@ -105,6 +105,40 @@ silently truncated, reordered or corrupted object.
   are read *before* the inventory is fetched so an in-flight write can never be mistaken for a loss.
 * With fewer than two eligible workers the system reports degraded protection (`under_replicated_chunks`, pending
   tasks with `last_error`) and retries when capacity returns.
+* Copies whose repair or rebalance move was cut off by a controller restart (a `PENDING` replica row of a committed
+  object older than the repair lease) are retired by the scanner; the reaper deletes the file.
+
+## 6a. Rebalancing and scaling (`rebalance.py`)
+
+Placement fills the least-loaded worker with *new* chunks, but stored data would stay where it is. When a new or empty
+worker joins, it would hold nothing old for a long time. The **rebalancer** (every 15 s) closes that gap:
+
+* **When:** the replica counts of the HEALTHY, non-draining workers differ by more than `REBALANCE_TOLERANCE` (2).
+  It waits while repair has work: any active repair task, or any chunk that does not have exactly two healthy copies on
+  live workers (under-replicated, or a surplus copy waiting to be trimmed). Repair always comes first.
+* **What:** a greedy plan moves one replica at a time from the fullest worker to the emptiest one with free space, up to
+  `REBALANCE_BATCH` (16) moves per round, 2 at a time. It only picks chunks that are completely stable: two healthy
+  copies, no other copy in flight, and no repair task. The receiving worker must not already hold the chunk.
+* **How (never fewer than two copies):**
+  1. A `PENDING` replica row is created on the receiving worker.
+  2. The donor worker pushes the chunk directly to the receiver with the same verified `/send` command that repair uses.
+  3. In **one transaction** the new copy becomes `HEALTHY` and the donor's copy becomes `DELETING`, but only if the
+     chunk then has at least three healthy copies. The reaper then deletes the donor's file.
+
+  A failed copy is rolled back, and the donor keeps its copy.
+* **Races:**
+  - If the object is deleted during a move, deletion has already turned every replica row, including the new
+    `PENDING` one, into `DELETING`. Step 3 then changes nothing and the reaper removes the copy.
+  - If the other copy goes bad during the move, the healthy count is only 2, so the donor's copy is kept.
+* **Scale in:** `POST /internal/workers/{id}/drain` stops placement on the worker. The rebalancer moves its replicas
+  away first, each one to the least-loaded worker that does not already hold that chunk, with the same copy → verify →
+  retire steps. Once it holds nothing, the container can be stopped. Its `DEAD` state then triggers no repair at all.
+  `DELETE /internal/workers/{id}` then removes it from the registry. Removal is refused while the worker is alive, and
+  while removing it would leave any chunk with fewer than two healthy copies elsewhere. A draining flag survives
+  restarts (column `workers.draining`, migration 004).
+* **Measured** (demo 7): with 4 workers × 53 replicas, a new worker5 received 41 replicas in about 12 s. Every chunk
+  stayed at exactly two healthy copies, the donors' files were deleted, and all objects downloaded byte-identical.
+  Draining it moved all of its replicas back in about 16 s, and stopping it then caused no repair.
 
 ## 7. Data integrity (`scrub.py`)
 
@@ -160,6 +194,31 @@ background work, so foreground reads/writes keep priority while repairs still ma
 concurrency limits, not object size — measured in `scripts/phase9_test.sh` (controller peak RSS +12 MiB for a 384 MiB
 upload; a worker is bounded by its cache budget).
 
+## 10a. Monitoring (`prom_metrics.py`, `monitoring/`)
+
+Prometheus (`prometheus` container, host port 9090) scrapes `GET /metrics` on the controller and on each worker every
+5 s; Grafana (`grafana`, host port 3000) has the data source and the "Object Store" dashboard provisioned from files, so
+`docker compose up` needs no manual setup. The exposition format is written by hand (`app/common/prom.py`, no new
+dependency) from the same in-process counters that `/internal/metrics` returns as JSON.
+
+* **Two views of worker health.** `up{job="workers"}` is Prometheus's own reachability (a stopped container is DOWN within one
+  scrape); `objstore_worker_state` is the controller's decision from heartbeats (DEAD after 15 s). Seeing both on one
+  timeline shows the detection delay.
+* **Cluster gauges come from PostgreSQL at scrape time**, never from a cache: under-replicated and unavailable chunks,
+  replicas per worker and state, repair queue, objects. The scrape is a handful of `COUNT` queries.
+* **Counters reset on restart**; Prometheus's `rate()`/`increase()` handle resets. Known counters are declared at 0 at
+  start-up so panels show 0, not "no data".
+* **Histograms**: end-to-end upload and download time, and *time to heal* (repair task queued → chunk has 2 healthy
+  replicas again).
+* `worker_id` labels: the controller emits them for per-worker gauges; for worker metrics Prometheus attaches them per
+  scrape target, so both line up in Grafana.
+* **Dashboard design.** The JSON is generated by `monitoring/grafana/generate_dashboard.py`. Each worker has one fixed
+  colour in every panel; other series use a fixed colour order. These colours were checked for colour-blind contrast
+  on the dark panel background. Green, amber and red are used only for health state. Status tiles stay neutral while
+  everything is fine. Each panel has one y-axis. Dashed lines (worker4, read, waiting, p95) give a second cue so no
+  series depends on colour alone.
+* Monitoring is optional: nothing in the object store depends on Prometheus or Grafana.
+
 ## 11. Decisions on open points from the plan
 
 | Question | Decision |
@@ -169,7 +228,8 @@ upload; a worker is bounded by its cache budget).
 | Upload replication | Chain: the controller sends each chunk to one worker, which forwards it to the second (halves the controller's upload bandwidth). The forwarding worker releases its own transfer slot first, so two workers forwarding to each other cannot deadlock |
 | Repair transfer | Controller-commanded, worker-to-worker: the source pushes straight to the target and the target verifies against the controller's checksum, so the controller never carries chunk data and a bad copy can never become `HEALTHY` |
 | Chunk id | `<object_id>-<index>`: unique, ordered, makes resume and cache-invalidation trivial |
-| Replica placement | Least-loaded first among HEALTHY workers with free space, always two distinct workers |
+| Replica placement | Least-loaded first among HEALTHY, non-draining workers with free space, always two distinct workers; the rebalancer evens out existing data |
+| Adding / removing workers | Join: register, then rebalance (copy → verify → retire). Leave: drain, stop, forget. A move never lowers a chunk below two healthy copies |
 | Orphan policy | Never deleted immediately; tombstoned chunks at once, unknown ones after a grace period |
 | Dead worker with the only copy | Repair waits for it to return rather than declaring loss |
 

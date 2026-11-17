@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     orphan_grace_seconds: float = 120.0
     repair_lease_seconds: float = 120.0
     tombstone_retention_seconds: float = 86400.0
+    rebalance_enabled: bool = True
+    rebalance_interval: float = 15.0
+    rebalance_tolerance: int = 2     # allowed difference in replica count between the fullest and emptiest worker
+    rebalance_batch: int = 16        # replicas moved per round at most
+    rebalance_concurrency: int = 2
 
     # worker
     worker_id: str = "worker-local"

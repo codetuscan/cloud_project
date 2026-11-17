@@ -11,7 +11,7 @@ from app.common.errors import install_error_handlers
 from app.common.requestid import RequestIdMiddleware
 from app.common.logging import setup_logging
 from app.common.responses import JSONResponseNL
-from app.worker import agent, disk, scrub
+from app.worker import agent, disk, prom_metrics, scrub
 from app.worker import api
 from app.worker.api import router
 
@@ -21,6 +21,7 @@ log = logging.getLogger("worker")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging(settings.worker_id)
+    prom_metrics.declare()  # every known counter exists at 0 from the first scrape
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
     removed = disk.init()
     log.info("worker %s ready (data_dir=%s, stale tmp files removed=%d, chunks on disk=%d)",

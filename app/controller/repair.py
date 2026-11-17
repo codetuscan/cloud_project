@@ -12,6 +12,7 @@ import logging
 import random
 import time
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 
@@ -40,7 +41,7 @@ async def _retry(pool, task, why: str) -> None:
     log.warning("repair of %s postponed (%ss): %s", task["chunk_id"], delay, why)
 
 
-async def _command_copy(state, src, tgt, chunk) -> str:
+async def _command_copy(state, src, tgt, chunk, counter: str = "repair_direct_copies") -> str:
     """Tell worker `src` to push the chunk straight to worker `tgt`; no chunk bytes pass through the controller.
 
     The source verifies the chunk against its own record AND our checksum, the target verifies it again before
@@ -60,7 +61,7 @@ async def _command_copy(state, src, tgt, chunk) -> str:
         return "source_unreachable"
     body = r.json()
     if body.get("ok"):
-        metrics.inc("repair_direct_copies")
+        metrics.inc(counter)
         return "ok"
     reason = body.get("reason")
     if reason == "source_missing":
@@ -168,6 +169,10 @@ async def execute(state, task) -> None:
                            "WHERE chunk_id=$1 AND state IN ('CORRUPT','MISSING')", chunk["chunk_id"])
         meta_cache.invalidate_chunk(chunk["chunk_id"])
         await _finish(pool, task["task_id"], "DONE")
+        created = task.get("created_at")
+        if isinstance(created, datetime):  # queued -> protected again (includes backoff waits)
+            healed = (datetime.now(timezone.utc) - created).total_seconds()
+            metrics.observe("repair_time_to_heal_seconds", max(0.0, healed))
     else:
         await _retry(pool, task, f"only {healthy}/2 healthy replicas after attempt")
 
@@ -207,6 +212,15 @@ async def scan_once(pool) -> None:
         """UPDATE repair_tasks SET state='PENDING', updated_at=now()
            WHERE state='IN_PROGRESS' AND updated_at < now() - make_interval(secs => $1)""",
         float(settings.repair_lease_seconds))
+    # copies whose repair/rebalance was interrupted (controller restart): retire them; the reaper removes the file
+    stale = await pool.execute(
+        """UPDATE replicas SET state='DELETING', updated_at=now()
+           WHERE state='PENDING' AND updated_at < now() - make_interval(secs => $1)
+             AND chunk_id IN (SELECT c.chunk_id FROM chunks c JOIN objects o USING (object_id)
+                              WHERE o.state='COMMITTED')""",
+        float(settings.repair_lease_seconds))
+    if stale and stale != "UPDATE 0":
+        log.warning("retired interrupted copies: %s", stale)
     created = await pool.fetch(
         """INSERT INTO repair_tasks (task_id, chunk_id, reason, state)
            SELECT gen_random_uuid(), c.chunk_id, 'UNDER_REPLICATED', 'PENDING'

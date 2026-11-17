@@ -6,6 +6,7 @@ import logging
 import uuid
 import base64
 import random
+import time
 from datetime import datetime
 from urllib.parse import quote
 from pathlib import Path
@@ -87,6 +88,7 @@ def _busy(what: str) -> ApiError:
 async def upload_object(request: Request):
     """Admission control (bounded concurrent uploads) + size/space checks, then the real work."""
     state = request.app.state
+    t0 = time.monotonic()  # includes waiting for an upload slot: that is what the client experiences
     cl = request.headers.get("content-length")
     if cl and cl.isdigit():
         n = int(cl)
@@ -102,9 +104,12 @@ async def upload_object(request: Request):
         raise _busy("uploads")
     metrics.inc("uploads_started")
     try:
-        return await _do_upload(request)
+        resp = await _do_upload(request)
     finally:
         slot.release()
+    if resp.status_code == 201:  # a stored object (not an Idempotency-Key replay)
+        metrics.observe("upload_duration_seconds", time.monotonic() - t0)
+    return resp
 
 
 async def _do_upload(request: Request):
@@ -290,6 +295,7 @@ async def _fetch_chunk(state, chunk, candidates: list[dict]) -> bytes:
 @router.get("/api/v1/objects/{object_id}")
 async def download_object(object_id: str, request: Request):
     oid = _parse_uuid(object_id)
+    t0 = time.monotonic()
     state = request.app.state
     pool = state.pool
     m = await meta_cache.get_manifest(pool, oid)
@@ -322,6 +328,7 @@ async def download_object(object_id: str, request: Request):
                 metrics.inc("download_bytes", len(data))
                 yield data
             metrics.inc("downloads_completed")
+            metrics.observe("download_duration_seconds", time.monotonic() - t0)
         except BaseException:
             metrics.inc("downloads_aborted")
             raise

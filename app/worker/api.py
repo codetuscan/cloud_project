@@ -7,13 +7,13 @@ from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field
 
 from app.common import checksum as cs
-from app.common import metrics
+from app.common import metrics, prom
 from app.common.gate import Gate
 from app.common.config import settings
 from app.common.errors import ApiError
 from app.common.responses import JSONResponseNL
 from app.worker import cache as wcache
-from app.worker import disk, scrub
+from app.worker import disk, prom_metrics, scrub
 
 log = logging.getLogger("worker.api")
 router = APIRouter()
@@ -212,9 +212,11 @@ async def get_chunk(chunk_id: str):
             data, checksum = await asyncio.to_thread(disk.read_verified, chunk_id)
         except disk.ChunkMissing:
             wcache.chunk_cache.invalidate(chunk_id)
+            metrics.inc("chunk_get_missing")
             raise ApiError(404, "chunk not found")
         except disk.ChunkCorrupt as e:
             wcache.chunk_cache.invalidate(chunk_id)
+            metrics.inc("chunk_get_corrupt")
             log.error("chunk %s failed verification: %s", chunk_id, e)
             raise ApiError(500, f"chunk corrupt: expected {e.expected} got {e.actual}", "chunk_corrupt")
     wcache.chunk_cache.put(chunk_id, (data, checksum), size=len(data), token=token)
@@ -281,6 +283,12 @@ async def worker_status():
                                               "unreadable_found", "duration_seconds")},
         "report_queue_depth": await asyncio.to_thread(scrub.queue_depth),
     }
+
+
+@router.get("/metrics", include_in_schema=False)
+async def prometheus_metrics():
+    """Prometheus scrape endpoint (text format). /internal/metrics stays the JSON view."""
+    return Response(await prom_metrics.render(_transfers()), media_type=prom.CONTENT_TYPE)
 
 
 @router.get("/internal/metrics")

@@ -24,6 +24,7 @@ from pathlib import Path
 import httpx
 
 from app.common import checksum as cs
+from app.common import metrics
 from app.common.config import settings
 from app.worker import cache as wcache
 from app.worker import disk
@@ -142,6 +143,7 @@ async def _authoritative(client: httpx.AsyncClient, chunk_id: str) -> str | None
 
 async def _report(chunk_id: str, status: str, expected, actual) -> None:
     wcache.chunk_cache.invalidate(chunk_id)  # never keep serving a replica we just found damaged
+    metrics.inc(f"scrub_findings_{status.lower()}")
     payload = {
         "worker_id": settings.worker_id, "chunk_id": chunk_id, "status": status,
         "expected_checksum": expected, "actual_checksum": actual,
@@ -165,6 +167,8 @@ async def run_pass(client: httpx.AsyncClient) -> None:
             continue
         state["chunks_checked"] += 1
         state["bytes_checked"] += res["bytes"]
+        metrics.inc("scrub_chunks_checked")  # cumulative (state[] holds only the current/last pass)
+        metrics.inc("scrub_bytes_checked", res["bytes"])
         st = res["status"]
         if st in ("MISMATCH", "NOSUM"):
             auth = await _authoritative(client, cid)

@@ -2,6 +2,7 @@
 import logging
 import uuid
 
+from app.common import metrics
 from app.controller import meta_cache
 
 log = logging.getLogger("controller.replicas")
@@ -26,5 +27,6 @@ async def mark_bad(pool, chunk_id: str, worker_id: str, state: str, reason: str)
                     uuid.uuid4(), chunk_id, worker_id, reason)
     meta_cache.invalidate_chunk(chunk_id)
     if changed:
+        metrics.inc(f"replicas_marked_{state.lower()}")
         log.warning("replica %s on %s marked %s (%s); repair queued", chunk_id, worker_id, state, reason)
     return bool(changed)

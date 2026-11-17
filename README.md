@@ -38,8 +38,9 @@ Detailed documents: [API.md](API.md) (every endpoint) · [DESIGN.md](DESIGN.md) 
 
 ```bash
 git clone <this repo> && cd cloud_project
-docker compose up -d --build        # builds one image, starts postgres, controller and worker1..worker4
-docker compose ps                   # wait until all six containers are "healthy"
+docker compose up -d --build        # builds one image, starts postgres, controller, worker1..worker4,
+                                    # and the monitoring stack (prometheus, grafana)
+docker compose ps                   # wait until the six object-store containers are "healthy"
 curl -s localhost:8090/internal/status | python3 -m json.tool | head -30
 ```
 
@@ -82,6 +83,36 @@ docker exec worker1 curl -s -X POST localhost:9000/internal/scrub/trigger    # s
 docker compose logs -f controller                                     # repair / DEAD / scrub activity
 ```
 
+### Monitoring dashboard (Prometheus + Grafana)
+
+| What | URL |
+|---|---|
+| Grafana dashboard "Object Store" (opens without login, read-only; admin / `GRAFANA_ADMIN_PASSWORD` to edit) | http://localhost:3000 |
+| Prometheus (raw queries, target health under *Status → Targets*) | http://localhost:9090 |
+| Raw metrics, Prometheus text format | `curl -s localhost:8090/metrics` · `docker exec worker1 curl -s localhost:9000/metrics` |
+
+Prometheus scrapes the controller and the four workers every 5 s. The dashboard (refreshes every 5 s) shows, in rows:
+cluster overview (workers alive, under-replicated/unavailable chunks, objects, reachability and worker-state
+timelines) · workers (heartbeat age, replicas and bytes per worker, chunk I/O) · replication and repair (repair queue,
+repairs per minute, time to heal) · data integrity (corrupt/missing copies detected, scrubber activity, report queue) ·
+client traffic (throughput, request rates, p50/p95 latency, chain replication) · caches (hit ratio, memory;
+collapsed by default). Each worker keeps the same colour in every panel; amber and red appear only when something
+needs attention.
+Keep it open while running `./scripts/demo/05_worker_failure.sh` or `06_data_integrity.sh` to watch a failure being
+detected and repaired. The object store does not depend on the monitoring containers; they can be stopped at any time.
+
+### Add or remove a worker (rebalancing)
+
+```bash
+docker compose up -d worker5                                   # a 5th, empty worker joins (compose profile "scaleout")
+curl -s localhost:8090/internal/status | python3 -c "import json,sys; print(json.load(sys.stdin)['rebalance'])"
+#   -> existing replicas are moved onto worker5 until all workers hold about the same number (~15 s)
+curl -s -X POST localhost:8090/internal/workers/worker5/drain    # move everything off it again, while it is still up
+docker compose rm -sf worker5                                    # once it holds 0 replicas: stop it (nothing to repair)
+curl -s -X DELETE localhost:8090/internal/workers/worker5        # after ~15 s (DEAD): remove it from the cluster
+```
+`./scripts/demo/07_scale_out_and_in.sh` runs and checks this whole cycle.
+
 ### Try the failure scenarios by hand
 
 ```bash
@@ -113,12 +144,15 @@ Copy `.env.example` to `.env` to change defaults; `docker-compose.yml` passes th
 | `ADMISSION_TIMEOUT` | 30 s | How long a request waits for a slot before `503 server_busy` |
 | `MAX_UPLOAD_BYTES` | 21474836480 | Largest accepted upload (400 `too_large` above it) |
 | `UPLOAD_ABANDON_SECONDS` / `TOMBSTONE_RETENTION_SECONDS` | 3600 / 86400 | Cleanup policies |
+| `REBALANCE_ENABLED` / `_INTERVAL` / `_TOLERANCE` / `_BATCH` | true / 15 s / 2 / 16 | Rebalancer: on/off, round period, allowed replica-count difference between workers, moves per round |
+| `PROMETHEUS_PORT` / `GRAFANA_PORT` / `GRAFANA_ADMIN_PASSWORD` | 9090 / 3000 / admin | Monitoring stack |
 
 ## 5. Tests and demonstrations
 
 ```bash
-./scripts/run_unit_tests.sh                 # 60+ pytest unit tests, no cluster needed
+./scripts/run_unit_tests.sh                 # 107 pytest unit tests, no cluster needed
 ./scripts/demo/run_all.sh                   # the six demonstrations required by the course (narrated)
+./scripts/demo/07_scale_out_and_in.sh       # extra: add worker5, rebalance, drain, remove
 ./scripts/phase4_test.sh                    # end-to-end checks per phase (phase2_3 … phase10_persistence)
 ./scripts/run_all_tests.sh                  # everything (~40 min)
 ./scripts/cache_benchmark.sh                # cold vs warm vs caches-off read latency
@@ -130,11 +164,15 @@ The demos map one-to-one to the required demonstrations in the assignment; see [
 
 ```
 docker-compose.yml  Dockerfile  .env.example  requirements.txt  pytest.ini
-migrations/         001 schema · 002 idempotency key · 003 scrub statistics
-app/common/         config, errors, checksum, chunking maths, LRU cache, gate (backpressure), metrics
+migrations/         001 schema · 002 idempotency key · 003 scrub statistics · 004 draining flag
+app/common/         config, errors, checksum, chunking maths, LRU cache, gate (backpressure), metrics, prom (exposition)
 app/controller/     api.py (public API) · upload.py · placement.py · repair.py · reaper.py · health.py
                     meta_cache.py · replicas.py · internal_api.py · multipart_stream.py · store.py · main.py
+                    rebalance.py (moves replicas onto new workers, drains leaving ones) · prom_metrics.py (/metrics)
 app/worker/         api.py (chunk API) · disk.py (atomic storage) · scrub.py · cache.py · agent.py · main.py
+                    prom_metrics.py (/metrics)
+monitoring/         prometheus.yml · grafana/provisioning (datasource, dashboard provider)
+                    grafana/dashboards/objstore.json · grafana/generate_dashboard.py (regenerates the JSON)
 scripts/            phase*_test.sh · demo/ · run_all_tests.sh · clean_start.sh · cache_benchmark.sh
 tests/              pytest unit tests
 ```

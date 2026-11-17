@@ -19,6 +19,21 @@ docker compose up -d --build             # or ./scripts/clean_start.sh for a fre
 | 5 | Worker failure: `docker stop worker2` / `docker start worker2` — before, during, after; is replication maintained? | `05_worker_failure.sh` | worker2 declared DEAD after ~15 s; downloads keep working; the controller re-replicates the affected chunks onto live workers (2 healthy copies again, with worker2 *still down*); worker2 returns with its persistent chunks, surplus copies are trimmed; replication factor 2 maintained; final download identical |
 | 6 | Data integrity: intentionally corrupt stored data; show detection and handling | `06_data_integrity.sh` | Follows the 10-step corruption-recovery demonstration of the design plan: corrupt one replica on disk → the worker's scrubber reports expected vs actual checksum → controller marks it `CORRUPT`, queues a repair and picks the other replica as source → target verifies, fsyncs, renames → `HEALTHY`, 2 replicas on different workers → full download matches. Also shows a read that meets a bad replica (skipped, data still correct, copy repaired) and a deleted chunk file (found and restored) |
 
+**Extra: scaling (beyond the required six).** `./scripts/demo/07_scale_out_and_in.sh` starts an empty fifth
+worker and shows the rebalancer moving existing replicas onto it. Each chunk is copied, checked and only then
+removed from its old worker, so it always keeps two healthy copies. It then **drains** worker5, stops it (no repair
+is triggered, because it holds nothing) and removes it from the cluster. On the dashboard, watch *Healthy replicas per
+worker* level out, *Rebalancing · per min* spike, and worker5 turn blue (Draining) on *Worker state*.
+
+**Live dashboard.** Open http://localhost:3000 (Grafana, no login) next to the terminal while running demos 5 and 6:
+
+* Demo 5: on *Reachability*, worker2 turns DOWN within ~5 s. On *Worker state*, it turns DEAD at the 15 s heartbeat
+  timeout. *Under-replicated chunks* jumps and returns to 0 while worker2 is still down. *Repair activity* shows the
+  worker-to-worker copies. After `docker start worker2`, the surplus copies are trimmed (*Healthy replicas per worker*).
+* Demo 6: *Corrupt copies detected* / *Missing copies detected* go up, the *Corruption and loss events* panel shows
+  which path found each problem (read check, worker self-check, scrubber), and *Time to heal* shows how quickly the
+  copy was restored.
+
 ## Sample output (from a clean deployment)
 
 ### 5 — Worker failure
