@@ -391,7 +391,10 @@ dash = {
                               "enable": True, "hide": True, "iconColor": "rgba(0, 211, 255, 1)",
                               "name": "Annotations & Alerts", "type": "dashboard"}]},
     "templating": {"list": []}, "panels": panels,
-    "links": [{"title": "Prometheus", "type": "link", "url": "http://localhost:9090/targets",
+    "links": [{"title": "Traces (Jaeger)", "type": "link", "url": "http://localhost:16686/search?service=controller",
+               "icon": "external link", "targetBlank": True,
+               "tooltip": "One timeline per upload/download/repair across controller and workers"},
+              {"title": "Prometheus", "type": "link", "url": "http://localhost:9090/targets",
                "icon": "external link", "targetBlank": True, "tooltip": "Scrape targets"}],
     "description": "Mini distributed object store: 1 controller, 4 workers, 2 replicas per 1 MiB chunk.",
 }

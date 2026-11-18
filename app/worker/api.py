@@ -7,7 +7,7 @@ from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field
 
 from app.common import checksum as cs
-from app.common import metrics, prom
+from app.common import metrics, prom, tracing
 from app.common.gate import Gate
 from app.common.config import settings
 from app.common.errors import ApiError
@@ -53,6 +53,7 @@ async def put_chunk(chunk_id: str, request: Request):
             raise ApiError(400, "X-Forward-To must be an http:// address and cannot be combined with repair=true")
         forward = (request.headers.get("x-forward-worker-id", ""), fwd_addr.rstrip("/"))
 
+    tracing.annotate(chunk_id=chunk_id, repair=repair, forward_to=forward[0] if forward else None)
     async with _transfers():
         existing = None if repair else await asyncio.to_thread(disk.stored_checksum, chunk_id)
         if existing is not None and existing != expected:
@@ -70,23 +71,27 @@ async def put_chunk(chunk_id: str, request: Request):
             hasher_h = None
             if writer is None:  # idempotent retry: still verify the body matches
                 hasher_h = hashlib.sha256()
-            async for part in request.stream():
-                total += len(part)
-                if total > settings.chunk_size:
-                    raise ApiError(400, f"chunk larger than {settings.chunk_size} bytes")
-                if writer is not None:
-                    await asyncio.to_thread(writer.write, part)
-                else:
-                    hasher_h.update(part)
-                if keep is not None:
-                    keep.append(part)
+            with tracing.span("receive + write to temp file (hash)" if writer else "receive (already stored: verify)"):
+                async for part in request.stream():
+                    total += len(part)
+                    if total > settings.chunk_size:
+                        raise ApiError(400, f"chunk larger than {settings.chunk_size} bytes")
+                    if writer is not None:
+                        await asyncio.to_thread(writer.write, part)
+                    else:
+                        hasher_h.update(part)
+                    if keep is not None:
+                        keep.append(part)
+                tracing.annotate(bytes=total)
             actual = writer.checksum if writer else cs.fmt(hasher_h.hexdigest())
             if actual != expected:
+                tracing.fail("checksum mismatch")
                 metrics.inc("chunk_put_checksum_mismatches")
                 raise ApiError(400, f"checksum mismatch: expected {expected} got {actual}",
                                "checksum_mismatch")
             if writer is not None:
-                await asyncio.to_thread(writer.commit)
+                with tracing.span("fsync + atomic rename"):
+                    await asyncio.to_thread(writer.commit)
                 if keep is not None and wcache.chunk_cache.enabled:  # durable + verified: now safe to cache
                     wcache.chunk_cache.put(chunk_id, (b"".join(keep), expected), size=total)
         except BaseException:
@@ -113,6 +118,7 @@ def _http() -> httpx.AsyncClient:
     global _client
     if _client is None:
         _client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0))
+        tracing.instrument_client(_client)  # forwards and repair pushes continue the controller's trace
     return _client
 
 
@@ -123,6 +129,14 @@ async def close_client() -> None:
 
 async def _forward(chunk_id: str, checksum: str, data: bytes, target: tuple[str, str]) -> dict:
     """Send the chunk we just stored to the next worker. Never raises: the outcome goes back to the controller."""
+    with tracing.span(f"forward to {target[0] or target[1]}", chunk_id=chunk_id, bytes=len(data)):
+        out = await _forward_inner(chunk_id, checksum, data, target)
+        if not out["ok"]:
+            tracing.fail(out.get("error", "forward failed"))
+        return out
+
+
+async def _forward_inner(chunk_id: str, checksum: str, data: bytes, target: tuple[str, str]) -> dict:
     wid, addr = target
     last = "unknown error"
     for attempt in range(FORWARD_ATTEMPTS):
@@ -161,14 +175,18 @@ async def send_chunk(chunk_id: str, cmd: SendCommand):
     if not cs.valid(cmd.checksum) or not cmd.target_address.startswith("http://"):
         raise ApiError(400, "need a valid sha256 checksum and an http:// target_address")
 
+    tracing.annotate(chunk_id=chunk_id, target=cmd.target_address)
+
     def fail(reason: str, detail: str = ""):
+        tracing.fail(f"{reason} {detail}"[:200])
         metrics.inc("chunk_sends_failed")
         log.warning("send of %s to %s failed: %s %s", chunk_id, cmd.target_address, reason, detail)
         return JSONResponseNL(content={"ok": False, "reason": reason, "detail": detail})
 
     async with _transfers():  # released before the push so two workers sending to each other cannot deadlock
         try:
-            data, _ = await asyncio.to_thread(disk.read_verified, chunk_id)  # disk, never the cache: repairs must see the truth
+            with tracing.span("read + verify from disk"):
+                data, _ = await asyncio.to_thread(disk.read_verified, chunk_id)  # disk, never the cache: repairs must see the truth
         except disk.ChunkMissing:
             wcache.chunk_cache.invalidate(chunk_id)
             return fail("source_missing")
@@ -199,6 +217,7 @@ async def send_chunk(chunk_id: str, cmd: SendCommand):
 async def get_chunk(chunk_id: str):
     _check_id(chunk_id)
     hit = wcache.chunk_cache.get(chunk_id)
+    tracing.annotate(chunk_id=chunk_id, cache="HIT" if hit is not None else "MISS")
     if hit is not None:  # immutable, previously verified bytes
         data, checksum = hit
         metrics.inc("chunk_gets")
@@ -209,7 +228,8 @@ async def get_chunk(chunk_id: str):
         token = wcache.chunk_cache.token()
         try:
             wcache.count_disk_read()
-            data, checksum = await asyncio.to_thread(disk.read_verified, chunk_id)
+            with tracing.span("read + verify from disk"):
+                data, checksum = await asyncio.to_thread(disk.read_verified, chunk_id)
         except disk.ChunkMissing:
             wcache.chunk_cache.invalidate(chunk_id)
             metrics.inc("chunk_get_missing")
@@ -218,6 +238,7 @@ async def get_chunk(chunk_id: str):
             wcache.chunk_cache.invalidate(chunk_id)
             metrics.inc("chunk_get_corrupt")
             log.error("chunk %s failed verification: %s", chunk_id, e)
+            tracing.fail("chunk corrupt on disk")
             raise ApiError(500, f"chunk corrupt: expected {e.expected} got {e.actual}", "chunk_corrupt")
     wcache.chunk_cache.put(chunk_id, (data, checksum), size=len(data), token=token)
     metrics.inc("chunk_gets")

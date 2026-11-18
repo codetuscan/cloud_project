@@ -5331,6 +5331,14 @@
  ],
  "links": [
   {
+   "title": "Traces (Jaeger)",
+   "type": "link",
+   "url": "http://localhost:16686/search?service=controller",
+   "icon": "external link",
+   "targetBlank": true,
+   "tooltip": "One timeline per upload/download/repair across controller and workers"
+  },
+  {
    "title": "Prometheus",
    "type": "link",
    "url": "http://localhost:9090/targets",

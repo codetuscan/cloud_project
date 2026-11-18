@@ -16,13 +16,14 @@ wstat() { docker exec $1 curl -s localhost:9000/internal/cache/stats | jget "d['
 # worker chunk GET -> "<http code> <HIT|MISS|>" ; body sha256 left in /tmp/b on that worker
 wget_chunk() { docker exec $1 sh -c "curl -s -D /tmp/h -o /tmp/b -w '%{http_code}' localhost:9000/internal/chunks/$2; echo -n ' '; grep -i '^x-cache' /tmp/h | tr -d '\r' | cut -d' ' -f2"; }
 wbody_sha() { docker exec $1 sha256sum /tmp/b | cut -d' ' -f1; }
-cleanup() { rm -rf $T; unset META_CACHE_TTL META_CACHE_SIZE CHUNK_CACHE_BYTES SCRUB_INTERVAL RECONCILE_INTERVAL META_CACHE_ENABLED CHUNK_CACHE_ENABLED; docker compose up -d >/dev/null 2>&1; }
+cleanup() { rm -rf $T; unset META_CACHE_TTL META_CACHE_SIZE CHUNK_CACHE_BYTES SCRUB_INTERVAL RECONCILE_INTERVAL META_CACHE_ENABLED CHUNK_CACHE_ENABLED REBALANCE_ENABLED; docker compose up -d >/dev/null 2>&1; }
 trap cleanup EXIT
 up() { curl -s -F file=@"$1" $API/api/v1/objects | jget "d['object_id']"; }
 cluster_up() { sleep 10; wait_until "all 4 workers HEALTHY" 60 "[ \"\$(curl -s $API/internal/status | jget \"sum(1 for w in d['workers'] if w['state']=='HEALTHY')\")\" = 4 ]"; }
 
 echo "== Setup: small caches so limits are visible (meta: 3 entries, 5s TTL; worker: 3 MiB) =="
-export META_CACHE_TTL=5 META_CACHE_SIZE=3 CHUNK_CACHE_BYTES=3145728 SCRUB_INTERVAL=3600 RECONCILE_INTERVAL=600
+# the rebalancer is off here: its replica moves write into worker caches and would disturb the exact cache counters
+export META_CACHE_TTL=5 META_CACHE_SIZE=3 CHUNK_CACHE_BYTES=3145728 SCRUB_INTERVAL=3600 RECONCILE_INTERVAL=600 REBALANCE_ENABLED=false
 docker compose up -d >/dev/null 2>&1; cluster_up
 head -c $((8*1048576)) /dev/urandom > $T/obj.bin; SUM=$(sha256sum < $T/obj.bin)
 OID=$(up $T/obj.bin); echo "  test object $OID (8 chunks)"
@@ -128,9 +129,13 @@ docker exec $W sh -c "printf 'CORRUPTED' | dd of=/data/chunks/${CID:0:2}/$CID bs
 R=$(wget_chunk $W $CID); echo "  after silent disk corruption a read returns: $R (cache serves the previously verified bytes)"
 check "cached good bytes still served (documented trade-off, scrubber closes the gap)" "$R" "200 HIT"
 INV0=$(wstat $W invalidations)
-docker exec $W curl -s -X POST localhost:9000/internal/scrub/trigger >/dev/null; sleep 4
+DONE0=$(sql "select count(*) from repair_tasks where chunk_id='$CID' and state='DONE'")
+docker exec $W curl -s -X POST localhost:9000/internal/scrub/trigger >/dev/null
+# the pass is rate-limited: wait for the finding rather than sleeping a fixed time (independent of store size)
+wait_until "scrubber reached the corrupted chunk" 180 "[ \$(( \$(wstat $W invalidations) - INV0 )) -ge 1 ]"
 check "scrub finding evicted the cached entry (invalidation counter +1)" "$(( $(wstat $W invalidations) - INV0 ))" 1
-wait_until "repaired replica serves correct bytes again" 60 "[ \"\$(sql \"select state from replicas where chunk_id='$CID' and worker_id='$W'\")\" = HEALTHY ]"
+# wait for the REPAIR (a new DONE task), not just "HEALTHY": the replica is still HEALTHY until the report arrives
+wait_until "repaired replica serves correct bytes again" 60 "[ \"\$(sql \"select count(*) from repair_tasks where chunk_id='$CID' and state='DONE'\")\" -gt $DONE0 ] && [ \"\$(sql \"select state from replicas where chunk_id='$CID' and worker_id='$W'\")\" = HEALTHY ]"
 wget_chunk $W $CID >/dev/null
 check "repaired bytes are the original chunk" "sha256:$(wbody_sha $W)" "$EXP"
 

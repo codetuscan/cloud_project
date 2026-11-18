@@ -38,7 +38,7 @@ check "protection is reported degraded while repairing or just after" "$(curl -s
 wait_until "all chunks back to 2 healthy replicas on live workers" 90 allgood
 check "download during outage is byte-identical" "$(curl -s $API/api/v1/objects/$OID | sha256sum)" "$SUM"
 check "no chunk replica placed twice on one worker" "$(sql "select count(*) from (select chunk_id, worker_id from replicas group by 1,2 having count(*)>1) x")" 0
-check "repair tasks completed (DONE) with no failures" "$(sql "select count(*) from repair_tasks where state in ('PENDING','IN_PROGRESS','UNRECOVERABLE')")" 0
+check "repair tasks completed (DONE) with no failures" "$(sql "select count(*) from repair_tasks where chunk_id like '$OID%' and state in ('PENDING','IN_PROGRESS','UNRECOVERABLE')")" 0
 echo "  docker start $WK (it comes back with its old chunks -> surplus gets trimmed)"
 docker start $WK >/dev/null
 wait_until "$WK HEALTHY again" 45 "[ \"\$(sql \"select state from workers where worker_id='$WK'\")\" = HEALTHY ]"

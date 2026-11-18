@@ -32,7 +32,8 @@ show "docker compose up -d $V"; docker compose up -d $V >/dev/null 2>&1
 wait_for "$V registered and HEALTHY" 90 "[ \"\$(worker_state)\" = HEALTHY ]"
 note "New uploads would go to $V anyway (least-loaded placement), but existing data stays put unless it is moved."
 note "The rebalancer moves replicas from the fullest to the emptiest worker: copy -> verify -> retire the old copy."
-wait_for "rebalanced: $V holds data and the replica counts differ by at most 2" 180 \
+note "It waits until membership has been stable for 30 s (a restarting or flapping worker causes no churn), then moves."
+wait_for "rebalanced: $V holds data and the replica counts are within the tolerance" 240 \
   "[ \"\$(curl -s $API/internal/status | jget \"d['rebalance']['state']=='balanced' and d['rebalance']['loads'].get('$V',0)>0\")\" = True ]"
 counts
 docker compose logs --since $T0 controller 2>&1 | grep -E "rebalancing:|rebalanced " | head -3 | sed 's/^/    /'

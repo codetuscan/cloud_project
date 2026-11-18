@@ -24,6 +24,7 @@ from pathlib import Path
 import httpx
 
 from app.common import checksum as cs
+from app.common import tracing
 from app.common import metrics
 from app.common.config import settings
 from app.worker import cache as wcache
@@ -241,6 +242,7 @@ async def delivery_loop() -> None:
     """Send queued reports; delete a file only after the controller acknowledges it."""
     last_warn = 0.0
     async with httpx.AsyncClient(base_url=settings.controller_url, timeout=5.0) as client:
+        tracing.instrument_client(client)  # a report and the controller's reaction form one trace
         while True:
             try:
                 files = sorted(_queue_dir().glob("*.json"))
@@ -251,7 +253,14 @@ async def delivery_loop() -> None:
                         f.unlink(missing_ok=True)
                         continue
                     try:
-                        r = await client.post(item["endpoint"], json=item["payload"])
+                        p = item["payload"]
+                        if "chunk_id" in p:  # a finding (summaries are not traced)
+                            with tracing.operation(f"scrub report {p.get('status')}", chunk_id=p["chunk_id"],
+                                                   worker=p.get("worker_id"), expected=p.get("expected_checksum"),
+                                                   actual=p.get("actual_checksum")):
+                                r = await client.post(item["endpoint"], json=p)
+                        else:
+                            r = await client.post(item["endpoint"], json=p)
                     except httpx.HTTPError as e:
                         state["report_delivery_failures"] += 1
                         if time.monotonic() - last_warn > 30:

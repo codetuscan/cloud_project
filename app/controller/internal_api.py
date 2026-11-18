@@ -6,7 +6,7 @@ from typing import Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from app.common import metrics
+from app.common import metrics, tracing
 from app.common.config import settings
 from app.common.errors import ApiError
 from app.controller import meta_cache, replicas
@@ -123,6 +123,7 @@ async def scrub_results(res: ScrubResult, request: Request):
         res.worker_id, res.chunk_id, res.status, res.expected_checksum, res.actual_checksum, checked_at)
 
     def done(action: str, reason: str | None = None):
+        tracing.annotate(chunk_id=res.chunk_id, worker=res.worker_id, status=res.status, action=action, reason=reason)
         return {"status": "recorded", "action": action, **({"reason": reason} if reason else {})}
 
     rep = await pool.fetchrow(

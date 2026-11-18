@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from app.common import metrics
+from app.common import metrics, tracing
 from app.common.config import settings
 from app.controller import meta_cache, placement, replicas
 
@@ -63,6 +63,7 @@ async def _command_copy(state, src, tgt, chunk, counter: str = "repair_direct_co
     if body.get("ok"):
         metrics.inc(counter)
         return "ok"
+    tracing.event("copy failed", source=src["worker_id"], target=tgt["worker_id"], reason=body.get("reason"))
     reason = body.get("reason")
     if reason == "source_missing":
         await replicas.mark_bad(state.pool, chunk["chunk_id"], src["worker_id"], "MISSING", "repair source: 404")
@@ -194,7 +195,9 @@ async def runner(state, n: int) -> None:
                 await asyncio.sleep(1.0)
                 continue
             try:
-                await execute(state, task)
+                with tracing.operation("repair chunk", chunk_id=task["chunk_id"], reason=task["reason"],
+                                       attempt=task["attempts"]):
+                    await execute(state, task)
             except Exception as e:
                 log.exception("repair task %s crashed", task["task_id"])
                 await _retry(state.pool, task, f"internal error: {e!r}")

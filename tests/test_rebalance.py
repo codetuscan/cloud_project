@@ -166,3 +166,37 @@ async def test_recipient_that_already_has_a_row_is_skipped(copy_result):
     pool = FakePool({("c1", "w1"): "HEALTHY", ("c1", "w5"): "MISSING"})
     assert await rebalance.move(_state(pool), CH, DONOR, RECIP) is False
     assert pool.rows == {("c1", "w1"): "HEALTHY", ("c1", "w5"): "MISSING"}
+
+
+# ------------------------------------------------------------------ churn protection
+def test_tolerance_is_absolute_or_a_percentage_of_the_average():
+    assert rebalance.effective_tolerance({"a": 10, "b": 12}, 4, 10) == 4          # small cluster: absolute floor
+    assert rebalance.effective_tolerance({"a": 600, "b": 640}, 4, 10) == 62       # big cluster: 10 % of the mean
+    assert rebalance.effective_tolerance({}, 4, 10) == 4
+
+
+def test_small_imbalance_from_a_delete_does_not_move_data():
+    loads = {"w1": 60, "w2": 60, "w3": 57, "w4": 55}          # e.g. a few chunks deleted from w3/w4
+    tol = rebalance.effective_tolerance(loads, 4, 10)
+    assert rebalance.plan_moves(loads, tol, 16) == []
+
+
+def test_new_worker_still_triggers_with_churn_protection():
+    loads = {"w1": 60, "w2": 60, "w3": 60, "w4": 60, "w5": 0}
+    assert rebalance.plan_moves(loads, rebalance.effective_tolerance(loads, 4, 10), 16)
+
+
+def test_settle_timer_restarts_on_any_membership_change(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(rebalance.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(rebalance, "_membership", None)
+    rows = [{"worker_id": "w1", "state": "HEALTHY", "draining": False},
+            {"worker_id": "w2", "state": "HEALTHY", "draining": False}]
+    assert rebalance._settled(rows) == 0
+    now[0] += 40
+    assert rebalance._settled(rows) == 40                     # stable for 40 s
+    rows[1] = {"worker_id": "w2", "state": "DEAD", "draining": False}
+    assert rebalance._settled(rows) == 0                      # a worker died: timer restarts
+    now[0] += 5
+    rows.append({"worker_id": "w5", "state": "HEALTHY", "draining": False})
+    assert rebalance._settled(rows) == 0                      # a worker joined: restarts again

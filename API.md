@@ -1,7 +1,9 @@
 # API Reference
 
 Base URL of the controller: `http://localhost:8090`. Structured data is JSON; object data is binary.
-Timestamps are ISO-8601 (UTC). Every response carries an `X-Request-ID` header.
+Timestamps are ISO-8601 (UTC). Every response carries an `X-Request-ID` header. Responses of traced requests (all client
+API calls, while tracing is on) also carry `X-Trace-Id`. Open it in Jaeger (http://localhost:16686) to see the request
+as a timeline across the controller and workers.
 
 ## Error format and status codes
 

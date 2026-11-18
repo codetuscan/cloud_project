@@ -10,6 +10,7 @@ ok()   { echo "  PASS: $1"; pass=$((pass+1)); }
 bad()  { echo "  FAIL: $1"; fail=$((fail+1)); }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
+sql()  { docker exec postgres psql -U objstore -tAc "$1"; }
 wait_until() { local d="$1" t="$2"; shift 2; local i; for ((i=0;i<t;i+=2)); do if eval "$@" >/dev/null 2>&1; then ok "$d (after ~${i}s)"; return 0; fi; sleep 2; done; bad "$d (timed out after ${t}s)"; return 1; }
 cluster_up() { wait_until "controller healthy + 4 workers HEALTHY" 120 "[ \"\$(curl -s $API/internal/status | jget \"sum(1 for w in d['workers'] if w['state']=='HEALTHY')\")\" = 4 ]"; }
 trap 'rm -rf $T; docker start worker1 worker2 worker3 worker4 controller postgres >/dev/null 2>&1' EXIT
@@ -64,7 +65,11 @@ for w in worker1 worker2 worker3 worker4; do
   before=$(docker exec $w curl -s localhost:9000/internal/workers/$w/chunks | jget "sorted((c['chunk_id'],c['checksum']) for c in d['chunks'] if c['chunk_id'].startswith('$OID') or c['chunk_id'].startswith('$PID'))")
   docker restart $w >/dev/null; sleep 6
   after=$(docker exec $w curl -s localhost:9000/internal/workers/$w/chunks | jget "sorted((c['chunk_id'],c['checksum']) for c in d['chunks'] if c['chunk_id'].startswith('$OID') or c['chunk_id'].startswith('$PID'))")
-  check "$w: this test's chunk files (ids + checksums) identical after restart" "$after" "$before"
+  # a chunk the rebalancer legitimately moved away meanwhile is not a persistence failure: compare only chunks the
+  # metadata still places on this worker
+  still=$(sql "select chunk_id from replicas where worker_id='$w' and state='HEALTHY'" | tr '\n' ' ')
+  keep() { jget "sorted(c for c in $1 if c[0] in '$still'.split())" <<<'{}'; }
+  check "$w: this test's chunk files (ids + checksums) identical after restart" "$(keep "$after")" "$(keep "$before")"
   [ -n "$before" ] && [ "$before" != "[]" ] || note_empty=1
 done
 cluster_up

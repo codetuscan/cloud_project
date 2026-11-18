@@ -18,6 +18,8 @@ x-worker: &worker
     CHUNK_CACHE_ENABLED: ${CHUNK_CACHE_ENABLED:-true}
     CHUNK_CACHE_BYTES: ${CHUNK_CACHE_BYTES:-134217728}
     MAX_CONCURRENT_TRANSFERS: ${MAX_CONCURRENT_TRANSFERS:-8}
+    TRACING_ENABLED: ${TRACING_ENABLED:-true}
+    OTEL_ENDPOINT: http://jaeger:4318
   healthcheck:
     test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:9000/healthz')"]
     interval: 5s
@@ -69,12 +71,16 @@ services:
       ORPHAN_GRACE_SECONDS: ${ORPHAN_GRACE_SECONDS:-120}
       UPLOAD_ABANDON_SECONDS: ${UPLOAD_ABANDON_SECONDS:-3600}
       TOMBSTONE_RETENTION_SECONDS: ${TOMBSTONE_RETENTION_SECONDS:-86400}
+      TRACING_ENABLED: ${TRACING_ENABLED:-true}
+      OTEL_ENDPOINT: http://jaeger:4318
       READ_HEDGE_ENABLED: ${READ_HEDGE_ENABLED:-true}
       READ_HEDGE_DELAY: ${READ_HEDGE_DELAY:-0}
       READ_AHEAD_CHUNKS: ${READ_AHEAD_CHUNKS:-2}
       REBALANCE_ENABLED: ${REBALANCE_ENABLED:-true}
       REBALANCE_INTERVAL: ${REBALANCE_INTERVAL:-15}
-      REBALANCE_TOLERANCE: ${REBALANCE_TOLERANCE:-2}
+      REBALANCE_TOLERANCE: ${REBALANCE_TOLERANCE:-4}
+      REBALANCE_TOLERANCE_PCT: ${REBALANCE_TOLERANCE_PCT:-10}
+      REBALANCE_SETTLE_SECONDS: ${REBALANCE_SETTLE_SECONDS:-30}
       REBALANCE_BATCH: ${REBALANCE_BATCH:-16}
       MAX_CONCURRENT_TRANSFERS: ${MAX_CONCURRENT_TRANSFERS:-8}
     volumes:
@@ -131,6 +137,18 @@ services:
       - promdata:/prometheus
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
+    networks: [internal]
+
+  # Distributed tracing: the controller and workers send OpenTelemetry spans (OTLP/HTTP, port 4318); UI on 16686.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: jaeger
+    restart: unless-stopped
+    command: ["--memory.max-traces=20000"]     # in-memory store, bounded; traces are lost on restart
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${JAEGER_PORT:-16686}:16686"
     networks: [internal]
 
   grafana:

@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
 from app.common.config import settings
-from app.common import metrics
+from app.common import metrics, tracing
 from app.common.errors import install_error_handlers
 from app.common.gate import Gate
 from app.common.requestid import RequestIdMiddleware
@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI):
     app.state.pool = await store.connect(settings.database_url)
     await store.migrate(app.state.pool)
     app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
+    tracing.instrument_client(app.state.http)  # worker calls join the caller's trace (traceparent header)
     app.state.transfer_sem = Gate(settings.max_concurrent_transfers, "transfers")
     app.state.upload_gate = Gate(settings.max_concurrent_uploads, "uploads")
     app.state.download_gate = Gate(settings.max_concurrent_downloads, "downloads")
@@ -57,6 +58,7 @@ async def lifespan(app: FastAPI):
         t.cancel()
     await app.state.http.aclose()
     await app.state.pool.close()
+    tracing.shutdown()
 
 
 app = FastAPI(title="Object Store Controller", lifespan=lifespan, default_response_class=JSONResponseNL)
@@ -64,6 +66,7 @@ install_error_handlers(app)
 app.add_middleware(RequestIdMiddleware)
 app.include_router(internal_router)
 app.include_router(api_router)
+tracing.setup("controller", app)
 
 
 @app.get("/healthz")
@@ -122,7 +125,7 @@ async def status(detail: bool = False):
         "replicas": {r["state"]: r["n"] for r in reps},
         "under_replicated_chunks": under,
         "repair_tasks": {r["state"]: r["n"] for r in tasks},
-        "rebalance": {**rebalance.status, "tolerance": settings.rebalance_tolerance},
+        "rebalance": dict(rebalance.status),
     }
 
 

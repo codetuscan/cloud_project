@@ -39,7 +39,7 @@ Detailed documents: [API.md](API.md) (every endpoint) · [DESIGN.md](DESIGN.md) 
 ```bash
 git clone <this repo> && cd cloud_project
 docker compose up -d --build        # builds one image, starts postgres, controller, worker1..worker4,
-                                    # and the monitoring stack (prometheus, grafana)
+                                    # and the monitoring stack (prometheus, grafana, jaeger)
 docker compose ps                   # wait until the six object-store containers are "healthy"
 curl -s localhost:8090/internal/status | python3 -m json.tool | head -30
 ```
@@ -90,6 +90,7 @@ docker compose logs -f controller                                     # repair /
 |---|---|
 | Grafana dashboard "Object Store" (opens without login, read-only; admin / `GRAFANA_ADMIN_PASSWORD` to edit) | http://localhost:3000 |
 | Prometheus (raw queries, target health under *Status → Targets*) | http://localhost:9090 |
+| Jaeger: request traces, one timeline per upload/download/repair across controller and workers | http://localhost:16686 |
 | Raw metrics, Prometheus text format | `curl -s localhost:8090/metrics` · `docker exec worker1 curl -s localhost:9000/metrics` |
 
 Prometheus scrapes the controller and the four workers every 5 s. The dashboard (refreshes every 5 s) shows, in rows:
@@ -102,12 +103,29 @@ needs attention.
 Keep it open while running `./scripts/demo/05_worker_failure.sh` or `06_data_integrity.sh` to watch a failure being
 detected and repaired. The object store does not depend on the monitoring containers; they can be stopped at any time.
 
+### Request tracing (OpenTelemetry + Jaeger)
+
+Open **http://localhost:16686** and pick service `controller`.
+* **What a trace is:** every upload, download, repair, rebalance move and scrub report is one trace, shown as a timeline
+  across processes. For an upload you see: receive → staging file, then for each chunk the PUT to the first worker →
+  its write + fsync → its forward to the second worker → that worker's write + fsync, then `mark COMMITTED`.
+  PostgreSQL queries appear as child spans too.
+* **Finding a request:** every traced response carries `X-Trace-Id`. Paste it into Jaeger's search box.
+  Controller log lines written during a trace show the same `trace=<id>`.
+
+```bash
+curl -s -D - -o /dev/null -F file=@photo.jpg localhost:8090/api/v1/objects | grep -i x-trace-id
+```
+Heartbeats, health probes and other background polling are not traced, so Jaeger only lists real operations.
+Turn tracing off with `TRACING_ENABLED=false`. The object store does not depend on Jaeger: if Jaeger is down, spans are
+dropped.
+
 ### Add or remove a worker (rebalancing)
 
 ```bash
 docker compose up -d worker5                                   # a 5th, empty worker joins (compose profile "scaleout")
 curl -s localhost:8090/internal/status | python3 -c "import json,sys; print(json.load(sys.stdin)['rebalance'])"
-#   -> existing replicas are moved onto worker5 until all workers hold about the same number (~15 s)
+#   -> after ~30 s of stable membership, replicas are moved onto worker5 until all workers hold about the same number
 curl -s -X POST localhost:8090/internal/workers/worker5/drain    # move everything off it again, while it is still up
 docker compose rm -sf worker5                                    # once it holds 0 replicas: stop it (nothing to repair)
 curl -s -X DELETE localhost:8090/internal/workers/worker5        # after ~15 s (DEAD): remove it from the cluster
@@ -147,13 +165,15 @@ Copy `.env.example` to `.env` to change defaults; `docker-compose.yml` passes th
 | `UPLOAD_ABANDON_SECONDS` / `TOMBSTONE_RETENTION_SECONDS` | 3600 / 86400 | Cleanup policies |
 | `READ_HEDGE_ENABLED` / `READ_HEDGE_DELAY` | true / 0 | Ask the 2nd replica when the 1st is slow; delay in s, 0 = adaptive (p95 of recent reads, 20 ms–1 s) |
 | `READ_AHEAD_CHUNKS` | 2 | Chunks fetched ahead of the one being sent during a download |
-| `REBALANCE_ENABLED` / `_INTERVAL` / `_TOLERANCE` / `_BATCH` | true / 15 s / 2 / 16 | Rebalancer: on/off, round period, allowed replica-count difference between workers, moves per round |
+| `REBALANCE_ENABLED` / `_INTERVAL` / `_BATCH` | true / 15 s / 16 | Rebalancer: on/off, round period, moves per round |
+| `REBALANCE_TOLERANCE` / `_TOLERANCE_PCT` / `_SETTLE_SECONDS` | 4 / 10 / 30 s | Allowed replica-count difference between workers: the larger of 4 replicas or 10 % of the average. Data only moves after worker membership has been stable for 30 s |
 | `PROMETHEUS_PORT` / `GRAFANA_PORT` / `GRAFANA_ADMIN_PASSWORD` | 9090 / 3000 / admin | Monitoring stack |
+| `TRACING_ENABLED` / `JAEGER_PORT` | true / 16686 | OpenTelemetry tracing to Jaeger; Jaeger UI port |
 
 ## 5. Tests and demonstrations
 
 ```bash
-./scripts/run_unit_tests.sh                 # 135 pytest unit tests, no cluster needed
+./scripts/run_unit_tests.sh                 # 143 pytest unit tests, no cluster needed
 ./scripts/demo/run_all.sh                   # the six demonstrations required by the course (narrated)
 ./scripts/demo/07_scale_out_and_in.sh       # extra: add worker5, rebalance, drain, remove
 ./scripts/demo/08_slow_worker_and_ranges.sh # extra: hung worker -> hedged reads; partial downloads
@@ -169,7 +189,8 @@ The demos map one-to-one to the required demonstrations in the assignment; see [
 ```
 docker-compose.yml  Dockerfile  .env.example  requirements.txt  pytest.ini
 migrations/         001 schema · 002 idempotency key · 003 scrub statistics · 004 draining flag
-app/common/         config, errors, checksum, chunking maths, LRU cache, gate (backpressure), metrics, prom (exposition)
+app/common/         config, errors, checksum, chunking maths, LRU cache, gate (backpressure), metrics, prom (exposition),
+                    tracing (OpenTelemetry setup, sampler, span helpers)
 app/controller/     api.py (public API) · upload.py · placement.py · repair.py · reaper.py · health.py
                     meta_cache.py · replicas.py · internal_api.py · multipart_stream.py · store.py · main.py
                     reads.py (hedged reads, read-ahead, Range) · rebalance.py (moves replicas onto new workers,

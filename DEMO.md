@@ -33,6 +33,15 @@ takes 30 s. worker2 is not marked bad, because it is only slow. The script then 
 100 bytes, a range across a chunk boundary, the last 1000 bytes, and a 416 for a range past the end. On the dashboard,
 *Hedged reads · per min* shows the hedges and their wins.
 
+**Traces.** Open Jaeger at http://localhost:16686 (service `controller`) after any demo. Each upload, download,
+repair and rebalance move is one timeline across the controller and the workers it touched.
+* **Demo 2 (upload):** each chunk shows the chain `controller → first worker (write, fsync) → forward → second worker
+  (write, fsync)`.
+* **Demo 6 (corruption):** a `scrub report CORRUPT` trace (worker → controller marks it), then a `repair chunk` trace
+  (controller → source worker reads and verifies → pushes to the target → write, fsync).
+* **Demo 8 (slow worker):** download traces show a `hedge` event on the chunk whose first replica was frozen, and the
+  second replica answering.
+
 **Live dashboard.** Open http://localhost:3000 (Grafana, no login) next to the terminal while running demos 5 and 6:
 
 * Demo 5: on *Reachability*, worker2 turns DOWN within ~5 s. On *Worker state*, it turns DEAD at the 15 s heartbeat

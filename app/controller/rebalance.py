@@ -23,9 +23,10 @@ trimmed, or has an active repair task.
 """
 import asyncio
 import logging
+import math
 import time
 
-from app.common import metrics
+from app.common import metrics, tracing
 from app.common.config import settings
 from app.controller import meta_cache
 from app.controller.repair import _command_copy
@@ -34,7 +35,26 @@ log = logging.getLogger("controller.rebalance")
 
 # last view, served by /internal/status and /metrics
 status: dict = {"enabled": settings.rebalance_enabled, "state": "starting", "spread": 0, "loads": {},
-                "draining": {}, "moves_last_round": 0, "last_round_at": None}
+                "draining": {}, "tolerance": settings.rebalance_tolerance, "moves_last_round": 0,
+                "last_round_at": None}
+_membership: frozenset | None = None   # (worker_id, state, draining) of every worker at the last round
+_membership_changed = time.monotonic()
+
+
+def effective_tolerance(loads: dict[str, int], absolute: int, pct: float) -> int:
+    """Allowed spread: at least `absolute` replicas, or `pct` % of the average load (big clusters move less)."""
+    if not loads:
+        return absolute
+    return max(absolute, math.ceil(pct / 100.0 * sum(loads.values()) / len(loads)))
+
+
+def _settled(rows) -> float:
+    """Seconds since worker membership (who exists, state, draining) last changed."""
+    global _membership, _membership_changed
+    key = frozenset((r["worker_id"], r["state"], r["draining"]) for r in rows)
+    if key != _membership:
+        _membership, _membership_changed = key, time.monotonic()
+    return time.monotonic() - _membership_changed
 
 
 def plan_moves(loads: dict[str, int], tolerance: int, limit: int,
@@ -138,6 +158,15 @@ async def _candidates(pool, donor: str, recipient: str, n: int, taken: list[str]
 
 async def move(state, chunk, donor: dict, recipient: dict) -> bool:
     """Copy one replica donor -> recipient, then retire the donor's copy. True if the move completed."""
+    with tracing.operation(f"rebalance move {donor['worker_id']} → {recipient['worker_id']}",
+                           chunk_id=chunk["chunk_id"], donor=donor["worker_id"], recipient=recipient["worker_id"]):
+        ok = await _move(state, chunk, donor, recipient)
+        if not ok:
+            tracing.fail("move not completed")
+        return ok
+
+
+async def _move(state, chunk, donor: dict, recipient: dict) -> bool:
     pool, cid = state.pool, chunk["chunk_id"]
     claimed = await pool.fetchval(
         """INSERT INTO replicas (chunk_id, worker_id, state)
@@ -184,7 +213,10 @@ async def run_once(state) -> int:
     pool = state.pool
     loads, addresses, receivers, draining = await _loads(pool)
     spread = (max(loads.values()) - min(loads.values())) if len(loads) >= 2 else 0
-    status.update(loads=loads, spread=spread, draining=draining, last_round_at=time.time(), moves_last_round=0)
+    tolerance = effective_tolerance(loads, settings.rebalance_tolerance, settings.rebalance_tolerance_pct)
+    stable_for = _settled(await pool.fetch("SELECT worker_id, state, draining FROM workers"))
+    status.update(loads=loads, spread=spread, draining=draining, tolerance=tolerance, last_round_at=time.time(),
+                  moves_last_round=0)
     busy = await _cluster_busy(pool)
     if busy:
         status["state"] = f"waiting: {busy}"
@@ -200,9 +232,13 @@ async def run_once(state) -> int:
         status["state"] = "draining: no chunk can move yet (no eligible receiver)"
         return 0
     else:
-        plan = plan_moves(loads, settings.rebalance_tolerance, settings.rebalance_batch, receivers)
+        plan = plan_moves(loads, tolerance, settings.rebalance_batch, receivers)
         if not plan:
             status["state"] = "balanced"
+            return 0
+        if stable_for < settings.rebalance_settle_seconds:  # a joining/restarting/flapping worker: don't churn yet
+            status["state"] = (f"waiting: worker membership changed {stable_for:.0f}s ago "
+                               f"(settle {settings.rebalance_settle_seconds:.0f}s)")
             return 0
         for p in plan:
             pairs[p] = pairs.get(p, 0) + 1
@@ -215,7 +251,7 @@ async def run_once(state) -> int:
         if not jobs:
             status["state"] = "no movable chunks"
             return 0
-        why = f"replica counts {dict(sorted(loads.items()))} (spread {spread} > tolerance {settings.rebalance_tolerance})"
+        why = f"replica counts {dict(sorted(loads.items()))} (spread {spread} > tolerance {tolerance})"
 
     status["state"] = f"moving {len(jobs)} replica(s)"
     log.info("rebalancing: %s, moving %d replica(s): %s", why, len(jobs),

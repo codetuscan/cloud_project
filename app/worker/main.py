@@ -6,6 +6,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 
+from app.common import tracing
 from app.common.config import settings
 from app.common.errors import install_error_handlers
 from app.common.requestid import RequestIdMiddleware
@@ -32,12 +33,14 @@ async def lifespan(app: FastAPI):
     for t in tasks:
         t.cancel()
     await api.close_client()
+    tracing.shutdown()
 
 
 app = FastAPI(title="Object Store Worker", lifespan=lifespan, default_response_class=JSONResponseNL)
 install_error_handlers(app)
 app.add_middleware(RequestIdMiddleware)
 app.include_router(router)
+tracing.setup(settings.worker_id, app)
 
 
 @app.get("/healthz")

@@ -62,7 +62,7 @@ echo "== C. Manual trigger + per-worker scrub status =="
 for w in worker1 worker2 worker3 worker4; do docker exec $w curl -s -X POST localhost:9000/internal/scrub/trigger >/dev/null; done
 sleep 8
 check "every live worker finished at least one pass" "$(curl -s $API/internal/status | jget "all(w['last_scrub'] and w['last_scrub']['passes']>=1 for w in d['workers'] if w['state']!='DEAD')")" True
-curl -s $API/internal/status | jget "'\n'.join('    %s: passes=%d checked=%d bytes=%d corrupt=%d missing=%d (%.2fs)'%(w['worker_id'],w['last_scrub']['passes'],w['last_scrub']['chunks_checked'],w['last_scrub']['bytes_checked'],w['last_scrub']['corrupt_found'],w['last_scrub']['missing_found'],w['last_scrub']['duration_seconds']) for w in d['workers'])"
+curl -s $API/internal/status | jget "'\n'.join('    %s: passes=%d checked=%d bytes=%d corrupt=%d missing=%d (%.2fs)'%(w['worker_id'],w['last_scrub']['passes'],w['last_scrub']['chunks_checked'],w['last_scrub']['bytes_checked'],w['last_scrub']['corrupt_found'],w['last_scrub']['missing_found'],w['last_scrub']['duration_seconds']) for w in d['workers'] if w['last_scrub'])"
 check "no false positives: only the deliberately corrupted chunk (index 2) has a CORRUPT finding" "$(sql "select string_agg(distinct right(chunk_id,6), ',') from scrub_results where status='CORRUPT' and chunk_id like '$OID%'")" "000002"
 S=$(docker exec worker1 curl -s localhost:9000/internal/scrub/status)
 check "worker exposes scrub metrics (bytes, duration)" "$(jget "d['bytes_checked']>0 and d['duration_seconds']>=0" <<<"$S")" True
@@ -73,13 +73,15 @@ CID=$(jget "d['chunks'][4]['chunk_id']" <<<"$M"); WQ=$(jget "d['chunks'][4]['rep
 docker stop controller >/dev/null
 docker exec $WQ sh -c "printf 'CORRUPTED' | dd of=/data/chunks/${CID:0:2}/$CID bs=1 seek=50 conv=notrunc 2>/dev/null"
 docker exec $WQ curl -s -X POST localhost:9000/internal/scrub/trigger >/dev/null
-sleep 8
+# the pass is rate-limited (SCRUB_RATE_MB_S): wait for the finding instead of a fixed sleep, so the store size doesn't matter
+wait_until "scrubber reached the corrupted chunk" 180 "[ \"\$(docker exec $WQ sh -c 'ls /data/report_queue | grep -c CORRUPT')\" = 1 ]"
 check "report waits in worker's durable queue (controller down)" "$(docker exec $WQ sh -c 'ls /data/report_queue | grep -c CORRUPT')" 1
 check "delivery failures are counted" "$(docker exec $WQ curl -s localhost:9000/internal/scrub/status | jget "d['report_delivery_failures']>0")" True
 echo "  restarting the worker too: the queue must survive a worker restart"
 docker restart $WQ >/dev/null; sleep 6
 check "queued report still on disk after worker restart" "$(docker exec $WQ sh -c 'ls /data/report_queue | grep -c CORRUPT')" 1
 docker start controller >/dev/null
+wait_until "controller back" 90 "curl -sf $API/healthz"
 wait_until "report delivered after controller returned" 90 "[ \"\$(docker exec $WQ sh -c 'ls /data/report_queue | grep -c CORRUPT')\" = 0 ]"
 check "controller recorded the finding" "$(sql "select count(*) from scrub_results where chunk_id='$CID' and worker_id='$WQ' and status='CORRUPT'")" 1
 wait_until "and repaired it" 90 "[ \"\$(rstate $CID $WQ)\" = HEALTHY ]"

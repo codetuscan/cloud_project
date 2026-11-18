@@ -22,7 +22,7 @@ from collections import deque
 import httpx
 
 from app.common import checksum as cs
-from app.common import metrics
+from app.common import metrics, tracing
 from app.common.config import settings
 from app.controller import replicas
 
@@ -113,6 +113,7 @@ async def fetch_chunk(state, chunk, candidates: list[dict]) -> bytes:
     def launch() -> asyncio.Task:
         rep = queue.pop(0)
         t = asyncio.create_task(try_replica(state, chunk, rep))
+        t.objstore_worker = rep["worker_id"]
         pending[t] = rep
         return t
 
@@ -127,8 +128,11 @@ async def fetch_chunk(state, chunk, candidates: list[dict]) -> bytes:
                 gate = state.transfer_sem
                 if gate.inflight >= gate.limit:  # busy controller: never add load, keep waiting instead
                     metrics.inc("read_hedges_skipped_busy")
+                    tracing.event("hedge skipped: controller busy")
                     continue
                 metrics.inc("read_hedges")
+                tracing.event("hedge", slow=next(iter(pending.values()))["worker_id"], to=queue[0]["worker_id"],
+                              after_ms=round(hedge_delay() * 1000, 1))
                 log.info("chunk %s: %s slower than %.0f ms, hedging to %s", chunk["chunk_id"],
                          next(iter(pending.values()))["worker_id"], hedge_delay() * 1000, queue[0]["worker_id"])
                 hedge_tasks.add(launch())
@@ -139,13 +143,16 @@ async def fetch_chunk(state, chunk, candidates: list[dict]) -> bytes:
                 if data is not None:
                     if t in hedge_tasks:
                         metrics.inc("read_hedge_wins")
+                    tracing.annotate(served_by=t.objstore_worker, hedged=hedged, hedge_won=t in hedge_tasks)
                     return data
             if not pending and queue:  # every request so far failed: fall back to the next replica
                 metrics.inc("replica_read_fallbacks")
+                tracing.event("fallback", to=queue[0]["worker_id"])
                 launch()
     finally:
         for t in pending:
             t.cancel()
+    tracing.fail("no readable replica")
     raise RuntimeError(f"no readable replica for chunk {chunk['chunk_id']}")
 
 

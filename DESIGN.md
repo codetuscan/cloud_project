@@ -143,7 +143,14 @@ hides one worker round trip per chunk. Memory stays bounded at 3 chunks per down
 Placement fills the least-loaded worker with *new* chunks, but stored data would stay where it is. When a new or empty
 worker joins, it would hold nothing old for a long time. The **rebalancer** (every 15 s) closes that gap:
 
-* **When:** the replica counts of the HEALTHY, non-draining workers differ by more than `REBALANCE_TOLERANCE` (2).
+* **When:**
+  - **Threshold:** the replica counts of the HEALTHY, non-draining workers differ by more than the tolerance. That is
+    the larger of `REBALANCE_TOLERANCE` (4 replicas) and `REBALANCE_TOLERANCE_PCT` (10 %) of the average count.
+  - **Settle time:** worker membership (who is registered, their state, draining) must have been unchanged for
+    `REBALANCE_SETTLE_SECONDS` (30 s).
+  - **Why both:** without them, deleting one object or a worker restarting would set data moving. A worker that
+    restarts, flaps or has just joined causes no churn until things are stable. Draining is not delayed, because an
+    operator asked for it.
   It waits while repair has work: any active repair task, or any chunk that does not have exactly two healthy copies on
   live workers (under-replicated, or a surplus copy waiting to be trimmed). Repair always comes first.
 * **What:** a greedy plan moves one replica at a time from the fullest worker to the emptiest one with free space, up to
@@ -166,9 +173,11 @@ worker joins, it would hold nothing old for a long time. The **rebalancer** (eve
   `DELETE /internal/workers/{id}` then removes it from the registry. Removal is refused while the worker is alive, and
   while removing it would leave any chunk with fewer than two healthy copies elsewhere. A draining flag survives
   restarts (column `workers.draining`, migration 004).
-* **Measured** (demo 7): with 4 workers × 53 replicas, a new worker5 received 41 replicas in about 12 s. Every chunk
-  stayed at exactly two healthy copies, the donors' files were deleted, and all objects downloaded byte-identical.
-  Draining it moved all of its replicas back in about 16 s, and stopping it then caused no repair.
+* **Measured** (demo 7):
+  - **Scale out:** with 4 workers × 53 replicas, a new worker5 received 41 replicas. The moves themselves took about
+    12 s. With the 30 s settle time, worker5 was balanced about 1 minute after joining. Every chunk stayed at exactly
+    two healthy copies, the donors' files were deleted, and all objects downloaded byte-identical.
+  - **Scale in:** draining moved all of its replicas back in about 20 s, and stopping it then caused no repair.
 
 ## 7. Data integrity (`scrub.py`)
 
@@ -224,7 +233,7 @@ background work, so foreground reads/writes keep priority while repairs still ma
 concurrency limits, not object size — measured in `scripts/phase9_test.sh` (controller peak RSS +12 MiB for a 384 MiB
 upload; a worker is bounded by its cache budget).
 
-## 10a. Monitoring (`prom_metrics.py`, `monitoring/`)
+## 10a. Monitoring and tracing (`prom_metrics.py`, `tracing.py`, `monitoring/`)
 
 Prometheus (`prometheus` container, host port 9090) scrapes `GET /metrics` on the controller and on each worker every
 5 s; Grafana (`grafana`, host port 3000) has the data source and the "Object Store" dashboard provisioned from files, so
@@ -247,6 +256,22 @@ dependency) from the same in-process counters that `/internal/metrics` returns a
   on the dark panel background. Green, amber and red are used only for health state. Status tiles stay neutral while
   everything is fine. Each panel has one y-axis. Dashed lines (worker4, read, waiting, p95) give a second cue so no
   series depends on colour alone.
+* **Tracing** (`app/common/tracing.py`):
+  - **What's instrumented:** OpenTelemetry on the controller and on every worker, covering FastAPI server spans,
+    instrumented httpx clients and asyncpg queries.
+  - **One trace across processes:** the `traceparent` header carries the trace from the controller to the worker it
+    calls, and from that worker to the worker it forwards to. An upload, download, repair or rebalance move is
+    therefore *one* trace across all of them.
+  - **Hand-placed spans** mark the steps worth seeing: staging, each chunk, write to temp file, fsync + atomic rename,
+    forward, read + verify, the hedge decision (an event with which replica was slow), `mark COMMITTED`.
+  - **Sampling** decides only for spans without a parent. It keeps client and worker requests, plus background work
+    explicitly started as an *operation* (repair, rebalance move, scrub report). It drops everything else a background
+    loop does, such as heartbeats, probes and the periodic queries of the scanner and reaper, which would be thousands
+    of one-span traces. Children follow their parent, so a kept operation is complete everywhere.
+  - **Export:** OTLP/HTTP to Jaeger (all-in-one, in-memory, 20,000 traces) from a background thread with a bounded
+    queue. Jaeger being down costs nothing but the spans.
+  - **Finding a trace:** `X-Trace-Id` on responses and `trace=<id>` in log lines link a request, its logs and its
+    timeline.
 * Monitoring is optional: nothing in the object store depends on Prometheus or Grafana.
 
 ## 11. Decisions on open points from the plan

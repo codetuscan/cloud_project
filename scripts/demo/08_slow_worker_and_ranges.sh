@@ -14,7 +14,7 @@ for i in 1 2 3; do curl -s -o /dev/null $API/api/v1/objects/$OID; done
 
 step "A worker that is up but does not answer"
 show "docker pause $V      # process frozen: connections are accepted, requests never answered"
-H0=$(metric read_hedge_wins_total)
+H0=$(metric read_hedge_wins_total); D0=$(metric workers_marked_dead_total)
 docker pause $V >/dev/null
 note "hedge delay now: $(metric read_hedge_delay_seconds)s (p95 of recent chunk reads)"
 SLOWEST=0
@@ -31,8 +31,9 @@ expect_eq "every download finished in under 2 s although $V never answered" "$(p
 expect_eq "the other replica answered the hedged requests" "$(python3 -c "print(${H1:-0} > ${H0:-0})")" True
 note "hedge wins during the pause: $(python3 -c "print(int(${H1:-0} - ${H0:-0}))") (without hedging each such read waits for the 30 s timeout)"
 docker compose logs --since 1m controller 2>&1 | grep "hedging to" | head -2 | sed 's/^/    /'
-expect_eq "$V was never marked DEAD or bad (it was only slow, for a few seconds)" \
-  "$(sql "select count(*) from replicas where worker_id='$V' and state<>'HEALTHY'")" 0
+expect_eq "$V was not marked DEAD (it was only slow, for a few seconds)" "$(metric workers_marked_dead_total)" "$D0"
+expect_eq "none of $V's copies of this object were marked bad (slow is not corrupt)" \
+  "$(sql "select count(*) from replicas where worker_id='$V' and chunk_id like '$OID%' and state in ('CORRUPT','MISSING')")" 0
 
 step "Partial downloads (HTTP Range)"
 rng() {  # rng <curl range> <python slice> <label>

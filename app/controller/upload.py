@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 
 from app.common import checksum as cs
-from app.common import chunking, metrics
+from app.common import chunking, metrics, tracing
 from app.common.config import settings
 from app.controller import meta_cache, placement
 
@@ -94,12 +94,18 @@ async def _send_chain(state, first: placement.Target, second: placement.Target, 
 
 
 async def _process_chunk(state, obj, index: int, path: str) -> None:
+    with tracing.span(f"chunk {index}", chunk_index=index):
+        await _process_chunk_inner(state, obj, index, path)
+
+
+async def _process_chunk_inner(state, obj, index: int, path: str) -> None:
     pool = state.pool
     cs_size = obj["chunk_size"]
     offset, length = chunking.chunk_span(index, obj["size"], cs_size)
     data = await asyncio.to_thread(_read_slice, path, offset, length)
     checksum = cs.sha256_bytes(data)
     chunk_id = chunk_id_for(obj["object_id"], index)
+    tracing.annotate(chunk_id=chunk_id, size=length, checksum=checksum)
 
     await pool.execute(
         """INSERT INTO chunks (chunk_id, object_id, chunk_index, size, checksum)
@@ -126,8 +132,10 @@ async def _process_chunk(state, obj, index: int, path: str) -> None:
                 """INSERT INTO replicas (chunk_id, worker_id, state) VALUES ($1,$2,'PENDING')
                    ON CONFLICT (chunk_id, worker_id) DO UPDATE SET state='PENDING', updated_at=now()""",
                 chunk_id, t.worker_id)
+        tracing.annotate(targets=",".join(t.worker_id for t in targets))
         if len(targets) == 2:
             # the controller uploads ONE copy; the first worker forwards it to the second
+            tracing.annotate(chain=f"controller → {targets[0].worker_id} → {targets[1].worker_id}")
             results = await _send_chain(state, targets[0], targets[1], chunk_id, checksum, data)
         else:
             results = await asyncio.gather(
@@ -138,6 +146,7 @@ async def _process_chunk(state, obj, index: int, path: str) -> None:
                                    chunk_id, t.worker_id)
             elif isinstance(res, Exception):
                 log.warning("replica placement failed: %s", res)
+                tracing.event("replica failed", worker=t.worker_id, error=str(res)[:200])
                 failed.add(t.worker_id)
                 await pool.execute("DELETE FROM replicas WHERE chunk_id=$1 AND worker_id=$2 AND state='PENDING'",
                                    chunk_id, t.worker_id)
@@ -193,11 +202,12 @@ async def commit_upload(state, object_id) -> bool:
     if bad or have != obj["chunk_count"]:
         raise UploadUnavailable("not every chunk has 2 healthy replicas")
 
-    async with pool.acquire() as c:
-        async with c.transaction():
-            await c.execute("UPDATE objects SET state='COMMITTED', updated_at=now() "
-                            "WHERE object_id=$1 AND state='PENDING'", object_id)
-            await c.execute("DELETE FROM uploads WHERE object_id=$1", object_id)
+    with tracing.span("mark COMMITTED"):
+        async with pool.acquire() as c:
+            async with c.transaction():
+                await c.execute("UPDATE objects SET state='COMMITTED', updated_at=now() "
+                                "WHERE object_id=$1 AND state='PENDING'", object_id)
+                await c.execute("DELETE FROM uploads WHERE object_id=$1", object_id)
     meta_cache.invalidate_object(object_id)
     Path(path).unlink(missing_ok=True)  # cleanup policy: staged source removed after commit
     log.info("object %s committed (%d chunks)", object_id, obj["chunk_count"])
@@ -246,7 +256,8 @@ async def resume_loop(state) -> None:
                 state.active_uploads.add(oid)
                 try:
                     log.info("resuming staged upload %s", oid)
-                    await commit_upload(state, oid)
+                    with tracing.operation("resume staged upload", object_id=str(oid)):
+                        await commit_upload(state, oid)
                 except UploadUnavailable as e:
                     log.warning("resume of %s postponed: %s", oid, e)
                 except Exception as e:

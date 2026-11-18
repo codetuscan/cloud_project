@@ -83,11 +83,18 @@ echo "  after a 384 MiB upload:  controller peak RSS $((B/1024)) MiB, worker1 pe
 check "384 MiB object committed" "$([ -n "$O2" ] && echo yes)" yes
 check "controller peak RSS grew < 40 MiB despite 24x larger object" "$([ $(( (B - A) / 1024 )) -lt 40 ] && echo yes)" yes
 check "worker peak RSS = baseline + its 128 MiB chunk-cache budget + small slack (not the object size)" "$([ $(( (BW - AW) / 1024 )) -lt $((128 + 40)) ] && echo yes)" yes
+# Download: compare a SMALL download with a LARGE one, so the download path's one-time costs (read-ahead buffers,
+# tracing, allocator warm-up) are in the baseline and only growth with object size is measured.
+curl -s -o /dev/null $API/api/v1/objects/$O1; D=$(hwm_kb controller)
+echo "  after a 16 MiB download:   controller peak RSS $((D/1024)) MiB"
 START=$(date +%s); DLSUM=$(curl -s $API/api/v1/objects/$O2 | sha256sum); echo "  384 MiB download took $(( $(date +%s) - START ))s"
 check "384 MiB download byte-identical" "$DLSUM" "$BIGSUM"
 C=$(hwm_kb controller)
 echo "  after the 384 MiB download: controller peak RSS $((C/1024)) MiB"
-check "download also stays flat (< 40 MiB over the 16 MiB baseline)" "$([ $(( (C - A) / 1024 )) -lt 40 ] && echo yes)" yes
+check "download also stays flat (384 MiB download < 40 MiB over a 16 MiB download)" "$([ $(( (C - D) / 1024 )) -lt 40 ] && echo yes)" yes
+for i in 1 2; do curl -s -o /dev/null $API/api/v1/objects/$O2; done; C2=$(hwm_kb controller)
+echo "  after two more 384 MiB downloads: controller peak RSS $((C2/1024)) MiB"
+check "no growth over repeated large downloads (< 8 MiB)" "$([ $(( (C2 - C) / 1024 )) -lt 8 ] && echo yes)" yes
 echo "  memory plateau: three more 384 MiB uploads (1.1 GiB more data through the same worker)"
 O3=$(up $T/m384.bin); BW2=$(hwm_kb worker1)
 echo "  after the 2nd 384 MiB upload: worker1 peak RSS $((BW2/1024)) MiB (chunk cache is full; allocator + concurrency overhead included)"

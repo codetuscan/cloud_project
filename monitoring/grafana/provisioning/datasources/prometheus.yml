@@ -9,3 +9,9 @@ datasources:
     editable: false
     jsonData:
       timeInterval: 5s     # = scrape interval, so $__rate_interval is never too short
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false

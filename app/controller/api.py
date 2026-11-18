@@ -22,7 +22,7 @@ from app.common.responses import JSONResponseNL
 import httpx
 
 from app.common import checksum as cs
-from app.common import chunking, metrics
+from app.common import chunking, metrics, tracing
 from app.common.gate import Busy
 from app.controller import meta_cache, placement, reaper, reads, replicas, upload
 from app.controller.multipart_stream import StreamingUpload, UploadError
@@ -174,11 +174,15 @@ async def _do_upload(request: Request):
         try:
             # 2. receive the bytes
             su = StreamingUpload(ctype, part_path)
-            async for data in request.stream():
-                await asyncio.to_thread(su.feed, data)
-                if settings.max_upload_bytes and su.size > settings.max_upload_bytes:
-                    raise UploadError(f"upload exceeds the maximum of {settings.max_upload_bytes} bytes")
-            await asyncio.to_thread(su.finish)  # the file part was flushed + fsynced when it ended
+            with tracing.span("receive upload → staging file (hash, fsync)"):
+                async for data in request.stream():
+                    await asyncio.to_thread(su.feed, data)
+                    if settings.max_upload_bytes and su.size > settings.max_upload_bytes:
+                        raise UploadError(f"upload exceeds the maximum of {settings.max_upload_bytes} bytes")
+                await asyncio.to_thread(su.finish)  # the file part was flushed + fsynced when it ended
+                tracing.annotate(bytes=su.size)
+            tracing.annotate(object_id=str(object_id), size=su.size, name=su.filename,
+                             chunks=chunking.chunk_count(su.size, chunk_size))
             if su.file_parts == 0:
                 raise UploadError("multipart field 'file' is required")
             if su.size == 0:
@@ -209,8 +213,10 @@ async def _do_upload(request: Request):
 
         # 5. chunk + replicate
         try:
-            await upload.commit_upload(state, object_id)
+            with tracing.span("chunk + replicate", object_id=str(object_id)):
+                await upload.commit_upload(state, object_id)
         except upload.UploadUnavailable as e:
+            tracing.fail(f"kept in staging: {e}")
             metrics.inc("uploads_pending_503")
             log.warning("upload %s not committed yet: %s", object_id, e)
             raise ApiError(503, "not enough healthy workers to store 2 replicas right now; the upload is "
@@ -309,13 +315,17 @@ async def download_object(object_id: str, request: Request):
         metrics.inc("downloads_rejected_busy")
         raise _busy("downloads")
     metrics.inc("downloads_started")
+    tracing.annotate(object_id=str(oid), size=size, chunks=len(needed),
+                     range=f"{start}-{end}" if rng else None)
     if rng:
         metrics.inc("range_requests")
 
     async def fetch(c):
         cands = by_chunk[c["chunk_id"]][:]
         random.shuffle(cands)
-        return c, await _fetch_chunk(state, c, cands)
+        with tracing.span(f"chunk {c['chunk_index']}", chunk_id=c["chunk_id"],
+                          replicas=",".join(r["worker_id"] for r in cands)):
+            return c, await _fetch_chunk(state, c, cands)
 
     async def body():
         try:

@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     max_concurrent_transfers: int = 8
     max_http_concurrency: int = 200
     log_level: str = "INFO"
+    tracing_enabled: bool = False          # docker-compose turns it on; OTLP/HTTP to Jaeger
+    otel_endpoint: str = "http://jaeger:4318"
 
     # controller
     database_url: str = "postgresql://objstore:objstore@postgres:5432/objstore"
@@ -35,7 +37,9 @@ class Settings(BaseSettings):
     read_ahead_chunks: int = 2         # chunks fetched ahead of the one being sent to the client
     rebalance_enabled: bool = True
     rebalance_interval: float = 15.0
-    rebalance_tolerance: int = 2     # allowed difference in replica count between the fullest and emptiest worker
+    rebalance_tolerance: int = 4     # allowed replica-count difference fullest - emptiest worker (at least) ...
+    rebalance_tolerance_pct: float = 10.0  # ... or this % of the average count, whichever is larger
+    rebalance_settle_seconds: float = 30.0  # wait until worker membership was stable this long before balancing
     rebalance_batch: int = 16        # replicas moved per round at most
     rebalance_concurrency: int = 2
 
