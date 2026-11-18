@@ -60,10 +60,26 @@ automatically when workers return (the object is invisible until then).
 
 ### `GET /api/v1/objects/{object_id}` — download → 200
 
-Binary body with `Content-Type`, `Content-Length`, `Content-Disposition: attachment; filename=…`, `X-Object-Checksum`
-and `ETag`. Chunks are streamed in order; each chunk is verified against its authoritative checksum, bad or
-unavailable replicas are skipped, and the connection is aborted rather than returning truncated or wrong data.
-`404` for an unknown/deleted object; `503` if some chunk has no readable replica.
+Binary body with `Content-Type`, `Content-Length`, `Content-Disposition: attachment; filename=…`, `X-Object-Checksum`,
+`ETag` and `Accept-Ranges: bytes`. Chunks are streamed in order, with the next 2 chunks already being fetched.
+* **Verification:** each chunk is checked against its authoritative checksum. Bad or unavailable replicas are skipped.
+  The connection is aborted rather than returning truncated or wrong data.
+* **Slow replicas:** if a replica is slower than the hedge delay, the other replica is asked as well and the first
+  verified answer is used.
+* **Errors:** `404` for an unknown or deleted object; `503` if some chunk has no readable replica.
+
+**Partial downloads:** send `Range: bytes=<first>-<last>`, `bytes=<first>-` or `bytes=-<suffix length>`.
+* The response is **`206 Partial Content`** with `Content-Range: bytes <first>-<last>/<size>`.
+* Only the chunks that hold the range are read, each still verified whole.
+* A range starting at or after the end returns `416 range_not_satisfiable` with `Content-Range: bytes */<size>`.
+* Multiple ranges and malformed headers are ignored, and the whole object is returned (`200`).
+* With `If-Range: "<etag>"`, the range is honoured only if the ETag still matches.
+
+```bash
+curl -s -r 0-99 $API/api/v1/objects/$OID          # first 100 bytes  -> 206
+curl -s -r -1000 $API/api/v1/objects/$OID         # last 1000 bytes
+curl -s -C - -o big.bin $API/api/v1/objects/$OID  # resume an interrupted download
+```
 
 ### `GET /api/v1/objects/{object_id}/metadata` — 200
 
@@ -119,7 +135,7 @@ Oldest first. `limit` is 1–1000 (default 100). `next_cursor` is `null` on the 
 | `GET /healthz` | Liveness |
 | `GET /internal/status[?detail=true]` | Cluster view: workers (state, draining, heartbeat age, free/used, last scrub), object/chunk counts, replica counts by state, under-replicated chunks, repair tasks by state, cache and concurrency stats. `rebalance` holds `{enabled, state` (`balanced`, `moving N replica(s)`, `waiting: …`), `spread, loads, draining, moves_last_round, tolerance}`. `detail=true` adds each live worker's own `/internal/status` |
 | `GET /internal/metrics` | Counters (uploads, downloads, repairs, scrub reports, fallbacks, …), in-flight/peak/rejected per concurrency gate, metadata-cache statistics |
-| `GET /metrics` | The same counters plus cluster state, in **Prometheus text format** (scraped every 5 s). All names start with `objstore_`. Process counters: `objstore_<event>_total` (e.g. `uploads_committed`, `replicas_marked_corrupt`, `repairs_done`); histograms `objstore_upload_duration_seconds`, `objstore_download_duration_seconds`, `objstore_repair_time_to_heal_seconds`. Cluster gauges, computed from PostgreSQL at scrape time: `objstore_workers{state}`, `objstore_worker_state{worker_id,state}`, `objstore_worker_alive{worker_id}`, `objstore_worker_heartbeat_age_seconds{worker_id}`, `objstore_objects{state}`, `objstore_stored_bytes`, `objstore_committed_chunks`, `objstore_under_replicated_chunks`, `objstore_unavailable_chunks`, `objstore_replicas{state}`, `objstore_worker_replicas{worker_id,state}`, `objstore_repair_tasks{state}`, `objstore_repair_oldest_active_task_age_seconds`, `objstore_database_up`, `objstore_worker_draining{worker_id}`. Rebalancer: `objstore_rebalance_moves_total`, `objstore_rebalance_move_failures_total`, `objstore_rebalance_replica_spread`, `objstore_rebalance_moving`. Also gates (`objstore_gate_*{gate}`) and the metadata cache (`objstore_cache_*{cache="metadata"}`). If PostgreSQL is down, `objstore_database_up` is 0 and the process metrics are still served. |
+| `GET /metrics` | The same counters plus cluster state, in **Prometheus text format** (scraped every 5 s). All names start with `objstore_`. Process counters: `objstore_<event>_total` (e.g. `uploads_committed`, `replicas_marked_corrupt`, `repairs_done`); histograms `objstore_upload_duration_seconds`, `objstore_download_duration_seconds`, `objstore_repair_time_to_heal_seconds`. Cluster gauges, computed from PostgreSQL at scrape time: `objstore_workers{state}`, `objstore_worker_state{worker_id,state}`, `objstore_worker_alive{worker_id}`, `objstore_worker_heartbeat_age_seconds{worker_id}`, `objstore_objects{state}`, `objstore_stored_bytes`, `objstore_committed_chunks`, `objstore_under_replicated_chunks`, `objstore_unavailable_chunks`, `objstore_replicas{state}`, `objstore_worker_replicas{worker_id,state}`, `objstore_repair_tasks{state}`, `objstore_repair_oldest_active_task_age_seconds`, `objstore_database_up`, `objstore_worker_draining{worker_id}`. Reads: `objstore_read_hedges_total`, `objstore_read_hedge_wins_total`, `objstore_read_hedges_skipped_busy_total`, `objstore_read_hedge_delay_seconds`, `objstore_range_requests_total`. Rebalancer: `objstore_rebalance_moves_total`, `objstore_rebalance_move_failures_total`, `objstore_rebalance_replica_spread`, `objstore_rebalance_moving`. Also gates (`objstore_gate_*{gate}`) and the metadata cache (`objstore_cache_*{cache="metadata"}`). If PostgreSQL is down, `objstore_database_up` is 0 and the process metrics are still served. |
 | `GET /internal/cache/stats`, `POST /internal/cache/clear` | Metadata cache hit/miss/eviction/expiration/invalidation statistics; clear it (demo/testing) |
 
 ## Worker-facing endpoints (controller, internal network)

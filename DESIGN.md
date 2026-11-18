@@ -76,8 +76,38 @@ Manifest and replica map come from the metadata cache or PostgreSQL. For each ch
 on a live worker, fetch it, **verify size and SHA-256 against the authoritative checksum**, send it. A replica that is
 unreachable is skipped; a replica that is missing/corrupt is skipped *and reported* (`mark_bad` → state `CORRUPT` /
 `MISSING` + a repair task). If no replica of a chunk is readable the response is `503` before streaming starts when
-that is known in advance, otherwise the connection is aborted (headers already sent) — a client never receives a
-silently truncated, reordered or corrupted object.
+that is known in advance. Otherwise the connection is aborted, because headers were already sent. A client never
+receives a silently truncated, reordered or corrupted object.
+
+**Hedged reads** (`reads.py`): a slow replica is a different problem from a failed one.
+* **Problem:** a worker that accepts the connection but answers slowly (overloaded disk, frozen process) would hold a
+  download for the whole 30 s HTTP timeout.
+* **Hedge:** if the replica has not answered within the hedge delay, the controller also asks the other replica. It
+  uses the first answer that passes checksum verification and cancels the other request.
+* **Hedge delay:** by default this is adaptive. It is the p95 of the last 256 successful chunk reads, kept between
+  20 ms and 1 s. So only about the slowest 5 % of reads send a second request.
+* **Under load:** no hedge is sent while the controller's transfer gate is full, so hedging never adds load to a busy
+  controller.
+* **Failures and slowness are handled separately.** A replica that *fails* (unreachable, 404, corrupt) is replaced at
+  once and reported, as before. A replica that is merely *slow* is never marked bad.
+* **Measured** with `docker pause worker2`, which leaves the TCP connection open but never answers. A 5.5 MiB
+  download took **0.05 s with hedging and 30.0 s without**.
+
+**Read-ahead:** while chunk *i* is being sent, chunks *i+1 … i+`READ_AHEAD_CHUNKS`* (2) are already being fetched. This
+hides one worker round trip per chunk. Memory stays bounded at 3 chunks per download.
+* **Measured** on a 96 MiB object: read-ahead 0 → 141 MiB/s, 2 → 161 MiB/s, 4 → 242 MiB/s.
+* **Why only 2 by default:** each chunk fetched ahead holds one of the controller's transfer slots. With more, a few
+  parallel downloads would fill the gate and switch hedging off.
+
+**Range requests:**
+* **Request:** `Range: bytes=a-b`, `bytes=a-` or `bytes=-n` gets `206 Partial Content` with `Content-Range`.
+* **Chunks read:** only the chunks that hold the range are read. Each is still verified in full, then sliced.
+* **Edge cases:**
+  - A range that starts past the end gets `416` with `Content-Range: bytes */size`.
+  - Multi-range or malformed headers get the whole object (200), which RFC 9110 allows.
+  - If `If-Range` does not match the ETag, the client receives the whole object.
+* **Header:** every download advertises `Accept-Ranges: bytes`. Seeking in a video or resuming a download works without
+  any change to integrity.
 
 ## 6. Failure handling and repair (`repair.py`, `health.py`)
 
@@ -226,6 +256,7 @@ dependency) from the same in-process counters that `/internal/metrics` returns a
 | "1 MB" | 1 MiB = 1,048,576 bytes, one setting (`CHUNK_SIZE`) |
 | Language | Python 3.12 (FastAPI, asyncpg, httpx) |
 | Upload replication | Chain: the controller sends each chunk to one worker, which forwards it to the second (halves the controller's upload bandwidth). The forwarding worker releases its own transfer slot first, so two workers forwarding to each other cannot deadlock |
+| Slow replica on read | Hedge to the other replica after the adaptive p95 delay; the first verified answer wins. Slow is not marked bad; failed is |
 | Repair transfer | Controller-commanded, worker-to-worker: the source pushes straight to the target and the target verifies against the controller's checksum, so the controller never carries chunk data and a bad copy can never become `HEALTHY` |
 | Chunk id | `<object_id>-<index>`: unique, ordered, makes resume and cache-invalidation trivial |
 | Replica placement | Least-loaded first among HEALTHY, non-draining workers with free space, always two distinct workers; the rebalancer evens out existing data |

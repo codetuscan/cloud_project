@@ -25,6 +25,14 @@ removed from its old worker, so it always keeps two healthy copies. It then **dr
 is triggered, because it holds nothing) and removes it from the cluster. On the dashboard, watch *Healthy replicas per
 worker* level out, *Rebalancing · per min* spike, and worker5 turn blue (Draining) on *Worker state*.
 
+**Extra: slow worker and partial downloads.** `./scripts/demo/08_slow_worker_and_ranges.sh` freezes worker2 with
+`docker pause`. The worker still accepts connections but never answers, which is the hardest kind of failure for a
+reader. Every download still finishes in a fraction of a second, byte-identical, because each chunk read that waits
+longer than the adaptive hedge delay also asks the other copy (a *hedged read*). Without hedging, the same download
+takes 30 s. worker2 is not marked bad, because it is only slow. The script then checks Range requests: the first
+100 bytes, a range across a chunk boundary, the last 1000 bytes, and a 416 for a range past the end. On the dashboard,
+*Hedged reads · per min* shows the hedges and their wins.
+
 **Live dashboard.** Open http://localhost:3000 (Grafana, no login) next to the terminal while running demos 5 and 6:
 
 * Demo 5: on *Reachability*, worker2 turns DOWN within ~5 s. On *Worker state*, it turns DEAD at the 15 s heartbeat

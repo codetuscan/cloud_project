@@ -24,7 +24,7 @@ import httpx
 from app.common import checksum as cs
 from app.common import chunking, metrics
 from app.common.gate import Busy
-from app.controller import meta_cache, placement, reaper, replicas, upload
+from app.controller import meta_cache, placement, reaper, reads, replicas, upload
 from app.controller.multipart_stream import StreamingUpload, UploadError
 
 log = logging.getLogger("controller.api")
@@ -263,33 +263,8 @@ async def get_metadata(object_id: str, request: Request):
 
 # ---------------------------------------------------------------- download
 async def _fetch_chunk(state, chunk, candidates: list[dict]) -> bytes:
-    """Return verified bytes for one chunk, trying each healthy replica; report bad ones."""
-    for attempt, rep in enumerate(candidates):
-        if attempt:
-            metrics.inc("replica_read_fallbacks")
-        try:
-            async with state.transfer_sem:
-                r = await state.http.get(f"{rep['address']}/internal/chunks/{chunk['chunk_id']}")
-        except httpx.HTTPError as e:
-            log.warning("replica %s on %s unreachable: %r", chunk["chunk_id"], rep["worker_id"], e)
-            continue
-        if r.status_code == 404:
-            await replicas.mark_bad(state.pool, chunk["chunk_id"], rep["worker_id"], "MISSING", "read: 404")
-            continue
-        if r.status_code != 200:
-            if "chunk_corrupt" in r.text:
-                await replicas.mark_bad(state.pool, chunk["chunk_id"], rep["worker_id"], "CORRUPT",
-                                        "read: worker self-check failed")
-            else:
-                log.warning("replica %s on %s returned %s", chunk["chunk_id"], rep["worker_id"], r.status_code)
-            continue
-        data = r.content
-        if len(data) != chunk["size"] or cs.sha256_bytes(data) != chunk["checksum"]:
-            await replicas.mark_bad(state.pool, chunk["chunk_id"], rep["worker_id"], "CORRUPT",
-                                    "read: checksum mismatch at controller")
-            continue
-        return data
-    raise RuntimeError(f"no readable replica for chunk {chunk['chunk_id']}")
+    """Verified bytes of one chunk: hedged across its healthy replicas (see reads.py)."""
+    return await reads.fetch_chunk(state, chunk, candidates)
 
 
 @router.get("/api/v1/objects/{object_id}")
@@ -302,12 +277,29 @@ async def download_object(object_id: str, request: Request):
     if m is None:
         raise ApiError(404, "object not found")
     obj, chunks = m["obj"], m["chunks"]
-    by_chunk = {c["chunk_id"]: [r for r in c["replicas"] if r["state"] == "HEALTHY" and r["wstate"] != "DEAD"]
-                for c in chunks}
     if len(chunks) != obj["chunk_count"]:
         raise ApiError(500, "object manifest is incomplete")
+    size = obj["size"]
+    etag = f'"{(obj["checksum"] or "")[7:]}"'
+
+    # Range: one byte range of the object -> 206 with only the chunks that hold it
+    rng_header = request.headers.get("range")
+    if_range = request.headers.get("if-range")
+    if rng_header and if_range and if_range.strip() != etag:
+        rng_header = None  # the client's copy is outdated: send the whole object (RFC 9110 If-Range)
+    try:
+        rng = reads.parse_range(rng_header, size)
+    except reads.RangeNotSatisfiable:
+        raise ApiError(416, f"range not satisfiable (object size {size})", "range_not_satisfiable",
+                       headers={"Content-Range": f"bytes */{size}"})
+    start, end = rng if rng else (0, size - 1)
+    first, last = reads.chunk_span(start, end, obj["chunk_size"])
+    needed = [c for c in chunks if first <= c["chunk_index"] <= last]
+
+    by_chunk = {c["chunk_id"]: [r for r in c["replicas"] if r["state"] == "HEALTHY" and r["wstate"] != "DEAD"]
+                for c in needed}
     # fail before sending headers if some chunk has no replica at all
-    for c in chunks:
+    for c in needed:
         if not by_chunk.get(c["chunk_id"]):
             raise ApiError(503, f"no healthy replica available for chunk {c['chunk_index']}")
 
@@ -317,14 +309,22 @@ async def download_object(object_id: str, request: Request):
         metrics.inc("downloads_rejected_busy")
         raise _busy("downloads")
     metrics.inc("downloads_started")
+    if rng:
+        metrics.inc("range_requests")
+
+    async def fetch(c):
+        cands = by_chunk[c["chunk_id"]][:]
+        random.shuffle(cands)
+        return c, await _fetch_chunk(state, c, cands)
 
     async def body():
         try:
-            for c in chunks:
-                cands = by_chunk[c["chunk_id"]][:]
-                random.shuffle(cands)
-                # raising here aborts the connection: the client never gets a silently truncated object
-                data = await _fetch_chunk(state, c, cands)
+            # chunks i+1..i+READ_AHEAD are fetched while chunk i is sent; raising aborts the connection, so the
+            # client never gets a silently truncated object
+            async for c, data in reads.stream_chunks(fetch, needed, settings.read_ahead_chunks):
+                base = c["chunk_index"] * obj["chunk_size"]
+                if rng:  # verified as a whole above; now cut out the requested bytes
+                    data = data[max(0, start - base): end - base + 1]
                 metrics.inc("download_bytes", len(data))
                 yield data
             metrics.inc("downloads_completed")
@@ -338,13 +338,16 @@ async def download_object(object_id: str, request: Request):
     fname = obj["name"]
     ascii_name = fname.encode("ascii", "replace").decode().replace('"', "'").replace("?", "_")
     headers = {
-        "Content-Length": str(obj["size"]),
+        "Content-Length": str(end - start + 1),
+        "Accept-Ranges": "bytes",
         "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(fname)}",
         "X-Object-Checksum": obj["checksum"] or "",
-        "ETag": f'"{(obj["checksum"] or "")[7:]}"',
+        "ETag": etag,
     }
-    return StreamingResponse(body(), media_type=obj["content_type"], headers=headers,
-                             background=BackgroundTask(slot.release))
+    if rng:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return StreamingResponse(body(), status_code=206 if rng else 200, media_type=obj["content_type"],
+                             headers=headers, background=BackgroundTask(slot.release))
 
 
 # ---------------------------------------------------------------- list

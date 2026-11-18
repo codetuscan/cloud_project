@@ -62,6 +62,7 @@ curl -s -F file=@photo.jpg -F 'metadata={"owner":"alice","project":"cloud"}' $AP
 
 OID=<object_id from the response>
 curl -s $API/api/v1/objects/$OID -o photo_copy.jpg                       # download
+curl -s -r 0-1023 $API/api/v1/objects/$OID -o first_kib.bin               # partial download (Range -> 206)
 curl -s $API/api/v1/objects/$OID/metadata | python3 -m json.tool          # system + custom metadata + chunk placement
 curl -s -X PATCH -d '{"owner":"bob","tag":"v2","project":null}' \
      $API/api/v1/objects/$OID/metadata                                     # add/update keys; null removes a key
@@ -144,15 +145,18 @@ Copy `.env.example` to `.env` to change defaults; `docker-compose.yml` passes th
 | `ADMISSION_TIMEOUT` | 30 s | How long a request waits for a slot before `503 server_busy` |
 | `MAX_UPLOAD_BYTES` | 21474836480 | Largest accepted upload (400 `too_large` above it) |
 | `UPLOAD_ABANDON_SECONDS` / `TOMBSTONE_RETENTION_SECONDS` | 3600 / 86400 | Cleanup policies |
+| `READ_HEDGE_ENABLED` / `READ_HEDGE_DELAY` | true / 0 | Ask the 2nd replica when the 1st is slow; delay in s, 0 = adaptive (p95 of recent reads, 20 ms–1 s) |
+| `READ_AHEAD_CHUNKS` | 2 | Chunks fetched ahead of the one being sent during a download |
 | `REBALANCE_ENABLED` / `_INTERVAL` / `_TOLERANCE` / `_BATCH` | true / 15 s / 2 / 16 | Rebalancer: on/off, round period, allowed replica-count difference between workers, moves per round |
 | `PROMETHEUS_PORT` / `GRAFANA_PORT` / `GRAFANA_ADMIN_PASSWORD` | 9090 / 3000 / admin | Monitoring stack |
 
 ## 5. Tests and demonstrations
 
 ```bash
-./scripts/run_unit_tests.sh                 # 107 pytest unit tests, no cluster needed
+./scripts/run_unit_tests.sh                 # 135 pytest unit tests, no cluster needed
 ./scripts/demo/run_all.sh                   # the six demonstrations required by the course (narrated)
 ./scripts/demo/07_scale_out_and_in.sh       # extra: add worker5, rebalance, drain, remove
+./scripts/demo/08_slow_worker_and_ranges.sh # extra: hung worker -> hedged reads; partial downloads
 ./scripts/phase4_test.sh                    # end-to-end checks per phase (phase2_3 … phase10_persistence)
 ./scripts/run_all_tests.sh                  # everything (~40 min)
 ./scripts/cache_benchmark.sh                # cold vs warm vs caches-off read latency
@@ -168,7 +172,8 @@ migrations/         001 schema · 002 idempotency key · 003 scrub statistics ·
 app/common/         config, errors, checksum, chunking maths, LRU cache, gate (backpressure), metrics, prom (exposition)
 app/controller/     api.py (public API) · upload.py · placement.py · repair.py · reaper.py · health.py
                     meta_cache.py · replicas.py · internal_api.py · multipart_stream.py · store.py · main.py
-                    rebalance.py (moves replicas onto new workers, drains leaving ones) · prom_metrics.py (/metrics)
+                    reads.py (hedged reads, read-ahead, Range) · rebalance.py (moves replicas onto new workers,
+                    drains leaving ones) · prom_metrics.py (/metrics)
 app/worker/         api.py (chunk API) · disk.py (atomic storage) · scrub.py · cache.py · agent.py · main.py
                     prom_metrics.py (/metrics)
 monitoring/         prometheus.yml · grafana/provisioning (datasource, dashboard provider)

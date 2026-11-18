@@ -307,8 +307,9 @@ ts("Requests  ·  per min",
     ("increase(objstore_downloads_completed_total[1m])", "downloads completed"),
     ("increase(objstore_uploads_pending_503_total[1m])", "uploads kept pending (503)"),
     ("increase(objstore_downloads_aborted_total[1m])", "downloads aborted"),
-    ('sum(increase(objstore_gate_rejected_total{job="controller"}[1m]))', "rejected busy (503)")], 8, 8, fill=8,
-   colors=[SERIES[0], SERIES[2], SERIES[3], SERIES[4], SERIES[1]])
+    ('sum(increase(objstore_gate_rejected_total{job="controller"}[1m]))', "rejected busy (503)"),
+    ("increase(objstore_range_requests_total[1m])", "range requests (206)")], 8, 8, fill=8,
+   colors=[SERIES[0], SERIES[2], SERIES[3], SERIES[4], SERIES[1], SERIES[5]])
 ts("Latency", [('histogram_quantile(0.5, sum by (le) (rate(objstore_upload_duration_seconds_bucket[2m])))', "upload p50"),
                ('histogram_quantile(0.95, sum by (le) (rate(objstore_upload_duration_seconds_bucket[2m])))', "upload p95"),
                ('histogram_quantile(0.5, sum by (le) (rate(objstore_download_duration_seconds_bucket[2m])))', "download p50"),
@@ -336,6 +337,18 @@ ts("Worker transfer slots", [('objstore_gate_inflight{job="workers"}', "{{worker
                              ('objstore_gate_waiting{job="workers"}', "{{worker_id}} waiting")], 16, 8, fill=0,
    overrides=[color_override(".* waiting$", "", regexp=True)],
    desc="Per-worker bounded concurrency for chunk reads/writes (backpressure). Waiting = dashed.")
+y += 8
+ts("Hedged reads  ·  per min",
+   [("increase(objstore_read_hedges_total[1m])", "hedges sent (first replica slow)"),
+    ("increase(objstore_read_hedge_wins_total[1m])", "won by the second replica"),
+    ("increase(objstore_replica_read_fallbacks_total[1m])", "fallbacks (first replica failed)"),
+    ("increase(objstore_read_hedges_skipped_busy_total[1m])", "hedges skipped (controller busy)")], 0, 12, fill=8,
+   colors=[SERIES[0], SERIES[2], SERIES[1], SERIES[3]],
+   desc="A chunk read slower than the hedge delay also asks the other replica; the first verified answer wins and "
+        "the other request is cancelled. Wins ≈ sent means a replica is slow or hung.")
+ts("Hedge delay (adaptive)", [("objstore_read_hedge_delay_seconds", "delay")], 12, 12, unit="s", fill=8,
+   desc="p95 of recent chunk reads, clamped to READ_HEDGE_MIN_DELAY..READ_HEDGE_MAX_DELAY: only the slowest ~5% of "
+        "reads trigger a second request.")
 y += 8
 
 # ------------------------------------------------------------------------------------------------ caches

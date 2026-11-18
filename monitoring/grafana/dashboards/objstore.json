@@ -3710,6 +3710,16 @@
      "legendFormat": "rejected busy (503)",
      "refId": "E",
      "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "increase(objstore_range_requests_total[1m])",
+     "legendFormat": "range requests (206)",
+     "refId": "F",
+     "range": true
     }
    ],
    "fieldConfig": {
@@ -3826,6 +3836,21 @@
         "value": {
          "mode": "fixed",
          "fixedColor": "#d95926"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "range requests (206)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9085e9"
         }
        }
       ]
@@ -4580,21 +4605,280 @@
    }
   },
   {
+   "type": "timeseries",
+   "title": "Hedged reads  \u00b7  per min",
+   "id": 41,
+   "description": "A chunk read slower than the hedge delay also asks the other replica; the first verified answer wins and the other request is cancelled. Wins \u2248 sent means a replica is slow or hung.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 77
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "increase(objstore_read_hedges_total[1m])",
+     "legendFormat": "hedges sent (first replica slow)",
+     "refId": "A",
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "increase(objstore_read_hedge_wins_total[1m])",
+     "legendFormat": "won by the second replica",
+     "refId": "B",
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "increase(objstore_replica_read_fallbacks_total[1m])",
+     "legendFormat": "fallbacks (first replica failed)",
+     "refId": "C",
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "increase(objstore_read_hedges_skipped_busy_total[1m])",
+     "legendFormat": "hedges skipped (controller busy)",
+     "refId": "D",
+     "range": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 8,
+      "gradientMode": "opacity",
+      "showPoints": "never",
+      "pointSize": 4,
+      "spanNulls": false,
+      "lineInterpolation": "smooth",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      },
+      "axisBorderShow": false,
+      "axisPlacement": "auto",
+      "axisLabel": "",
+      "axisSoftMin": 0,
+      "barAlignment": 0,
+      "insertNulls": false,
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      }
+     },
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "#3987e5"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "hedges sent (first replica slow)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "won by the second replica"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#199e70"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "fallbacks (first replica failed)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "hedges skipped (controller busy)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#c98500"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Hedge delay (adaptive)",
+   "id": 42,
+   "description": "p95 of recent chunk reads, clamped to READ_HEDGE_MIN_DELAY..READ_HEDGE_MAX_DELAY: only the slowest ~5% of reads trigger a second request.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 77
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "objstore_read_hedge_delay_seconds",
+     "legendFormat": "delay",
+     "refId": "A",
+     "range": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 8,
+      "gradientMode": "opacity",
+      "showPoints": "never",
+      "pointSize": 4,
+      "spanNulls": false,
+      "lineInterpolation": "smooth",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      },
+      "axisBorderShow": false,
+      "axisPlacement": "auto",
+      "axisLabel": "",
+      "axisSoftMin": 0,
+      "barAlignment": 0,
+      "insertNulls": false,
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      }
+     },
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "#3987e5"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
    "type": "row",
    "title": "Caches",
-   "id": 41,
+   "id": 43,
    "collapsed": true,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 77
+    "y": 85
    },
    "panels": [
     {
      "type": "timeseries",
      "title": "Cache hit ratio",
-     "id": 42,
+     "id": 44,
      "description": "Hits / (hits + misses) over 1 min. Empty when there are no reads.",
      "datasource": {
       "type": "prometheus",
@@ -4604,7 +4888,7 @@
       "h": 8,
       "w": 12,
       "x": 0,
-      "y": 78
+      "y": 86
      },
      "targets": [
       {
@@ -4799,7 +5083,7 @@
     {
      "type": "timeseries",
      "title": "Chunk cache memory",
-     "id": 43,
+     "id": 45,
      "description": "Bytes held by each worker's RAM chunk cache (budget CHUNK_CACHE_BYTES).",
      "datasource": {
       "type": "prometheus",
@@ -4809,7 +5093,7 @@
       "h": 8,
       "w": 8,
       "x": 12,
-      "y": 78
+      "y": 86
      },
      "targets": [
       {
@@ -4979,7 +5263,7 @@
     {
      "type": "stat",
      "title": "Metadata cache entries",
-     "id": 44,
+     "id": 46,
      "description": "Objects cached by the controller's metadata cache (META_CACHE_SIZE).",
      "datasource": {
       "type": "prometheus",
@@ -4989,7 +5273,7 @@
       "h": 8,
       "w": 4,
       "x": 20,
-      "y": 78
+      "y": 86
      },
      "targets": [
       {

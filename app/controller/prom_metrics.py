@@ -8,7 +8,7 @@ import logging
 
 from app.common import metrics
 from app.common.prom import Exposition
-from app.controller import meta_cache, rebalance
+from app.controller import meta_cache, reads, rebalance
 
 log = logging.getLogger("controller.metrics")
 
@@ -31,6 +31,10 @@ HELP = {
     "replica_read_fallbacks": "Chunk reads that had to try another replica (first one unreachable/missing/corrupt).",
     "replicas_marked_corrupt": "Replicas moved HEALTHY -> CORRUPT (read check, scrub report or repair source check).",
     "replicas_marked_missing": "Replicas moved HEALTHY -> MISSING (read 404, scrub, inventory reconciliation).",
+    "read_hedges": "Chunk reads where the first replica was slow and a second replica was asked too.",
+    "read_hedge_wins": "Hedged chunk reads answered first by the second (hedge) replica.",
+    "read_hedges_skipped_busy": "Hedges not sent because the controller's transfer gate was full.",
+    "range_requests": "Downloads with an HTTP Range header (206 Partial Content).",
     "chunk_chain_puts": "Chunk uploads sent once to a worker that forwarded the second copy (chain replication).",
     "repair_direct_copies": "Worker-to-worker copies commanded by the controller.",
     "repairs_done": "Repair tasks finished DONE.",
@@ -137,6 +141,8 @@ async def render(state) -> str:
         e.gate(g, "controller")
     e.cache(meta_cache.cache.stats(), "metadata")
     e.gauge("active_uploads", len(state.active_uploads), "Uploads currently being received or committed.")
+    e.gauge("read_hedge_delay_seconds", round(reads.hedge_delay(), 4),
+            "Current hedge delay: a chunk read slower than this also asks the second replica.")
     rb = rebalance.status
     e.gauge("rebalance_enabled", rb["enabled"], "1 if the rebalancer is enabled.")
     e.gauge("rebalance_moving", rb["state"].startswith("moving"), "1 while the rebalancer is moving replicas.")

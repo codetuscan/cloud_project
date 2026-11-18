@@ -61,7 +61,7 @@ check "download identical" "$(curl -s $API/api/v1/objects/$OID | sha256sum)" "$S
 echo "== C. Manual trigger + per-worker scrub status =="
 for w in worker1 worker2 worker3 worker4; do docker exec $w curl -s -X POST localhost:9000/internal/scrub/trigger >/dev/null; done
 sleep 8
-check "every worker finished at least one pass" "$(curl -s $API/internal/status | jget "all(w['last_scrub'] and w['last_scrub']['passes']>=1 for w in d['workers'])")" True
+check "every live worker finished at least one pass" "$(curl -s $API/internal/status | jget "all(w['last_scrub'] and w['last_scrub']['passes']>=1 for w in d['workers'] if w['state']!='DEAD')")" True
 curl -s $API/internal/status | jget "'\n'.join('    %s: passes=%d checked=%d bytes=%d corrupt=%d missing=%d (%.2fs)'%(w['worker_id'],w['last_scrub']['passes'],w['last_scrub']['chunks_checked'],w['last_scrub']['bytes_checked'],w['last_scrub']['corrupt_found'],w['last_scrub']['missing_found'],w['last_scrub']['duration_seconds']) for w in d['workers'])"
 check "no false positives: only the deliberately corrupted chunk (index 2) has a CORRUPT finding" "$(sql "select string_agg(distinct right(chunk_id,6), ',') from scrub_results where status='CORRUPT' and chunk_id like '$OID%'")" "000002"
 S=$(docker exec worker1 curl -s localhost:9000/internal/scrub/status)

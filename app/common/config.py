@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     orphan_grace_seconds: float = 120.0
     repair_lease_seconds: float = 120.0
     tombstone_retention_seconds: float = 86400.0
+    read_hedge_enabled: bool = True
+    read_hedge_delay: float = 0.0      # seconds before asking a 2nd replica; 0 = adaptive (p95 of recent reads)
+    read_hedge_min_delay: float = 0.02
+    read_hedge_max_delay: float = 1.0
+    read_ahead_chunks: int = 2         # chunks fetched ahead of the one being sent to the client
     rebalance_enabled: bool = True
     rebalance_interval: float = 15.0
     rebalance_tolerance: int = 2     # allowed difference in replica count between the fullest and emptiest worker
