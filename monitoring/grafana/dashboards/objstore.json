@@ -6,7 +6,7 @@
  ],
  "timezone": "browser",
  "schemaVersion": 39,
- "version": 2,
+ "version": 3,
  "editable": false,
  "graphTooltip": 1,
  "liveNow": false,
@@ -37,6 +37,110 @@
     "iconColor": "rgba(0, 211, 255, 1)",
     "name": "Annotations & Alerts",
     "type": "dashboard"
+   },
+   {
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
+    },
+    "enable": true,
+    "iconColor": "rgba(208, 59, 59, 0.45)",
+    "name": "Alerts \u00b7 critical",
+    "expr": "ALERTS{alertstate=\"firing\", severity=\"critical\"}",
+    "titleFormat": "{{alertname}} {{worker_id}}",
+    "textFormat": "{{summary}}",
+    "tagKeys": "severity",
+    "step": "5s",
+    "useValueForTime": false,
+    "target": {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "ALERTS{alertstate=\"firing\", severity=\"critical\"}",
+     "refId": "Anno",
+     "interval": "5s",
+     "titleFormat": "{{alertname}} {{worker_id}}",
+     "textFormat": "{{summary}}",
+     "tagKeys": "severity",
+     "step": "5s",
+     "useValueForTime": false
+    }
+   },
+   {
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
+    },
+    "enable": true,
+    "iconColor": "rgba(250, 178, 25, 0.3)",
+    "name": "Alerts \u00b7 warning",
+    "expr": "ALERTS{alertstate=\"firing\", severity=\"warning\"}",
+    "titleFormat": "{{alertname}} {{worker_id}}",
+    "textFormat": "{{summary}}",
+    "tagKeys": "severity",
+    "step": "5s",
+    "useValueForTime": false,
+    "target": {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "ALERTS{alertstate=\"firing\", severity=\"warning\"}",
+     "refId": "Anno",
+     "interval": "5s",
+     "titleFormat": "{{alertname}} {{worker_id}}",
+     "textFormat": "{{summary}}",
+     "tagKeys": "severity",
+     "step": "5s",
+     "useValueForTime": false
+    }
+   },
+   {
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
+    },
+    "enable": true,
+    "iconColor": "rgba(122, 162, 224, 0.8)",
+    "name": "Alerts \u00b7 info",
+    "expr": "ALERTS{alertstate=\"firing\", severity=\"info\"} unless ALERTS{alertstate=\"firing\", severity=\"info\"} offset 15s",
+    "titleFormat": "{{alertname}} {{worker_id}}",
+    "textFormat": "{{summary}}",
+    "tagKeys": "severity",
+    "step": "5s",
+    "useValueForTime": false,
+    "target": {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "ALERTS{alertstate=\"firing\", severity=\"info\"} unless ALERTS{alertstate=\"firing\", severity=\"info\"} offset 15s",
+     "refId": "Anno",
+     "interval": "5s",
+     "titleFormat": "{{alertname}} {{worker_id}}",
+     "textFormat": "{{summary}}",
+     "tagKeys": "severity",
+     "step": "5s",
+     "useValueForTime": false
+    }
+   },
+   {
+    "datasource": {
+     "type": "grafana",
+     "uid": "-- Grafana --"
+    },
+    "enable": true,
+    "iconColor": "rgba(144, 133, 233, 0.35)",
+    "name": "Chaos & load events",
+    "target": {
+     "type": "tags",
+     "tags": [
+      "objstore-event"
+     ],
+     "matchAny": true,
+     "limit": 200
+    }
    }
   ]
  },
@@ -46,7 +150,7 @@
  "panels": [
   {
    "type": "row",
-   "title": "Cluster overview",
+   "title": "Alerts",
    "id": 1,
    "collapsed": false,
    "gridPos": {
@@ -59,8 +163,309 @@
   },
   {
    "type": "stat",
-   "title": "Workers alive",
+   "title": "Firing alerts",
    "id": 2,
+   "description": "Critical and warning alerts firing now (info alerts are listed but not counted). Rules: monitoring/alerts.yml.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 3,
+    "x": 0,
+    "y": 1
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "count(ALERTS{alertstate=\"firing\", severity=~\"critical|warning\"}) or vector(0)",
+     "legendFormat": "__auto",
+     "refId": "A",
+     "range": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       },
+       {
+        "color": "#d03b3b",
+        "value": 1
+       }
+      ]
+     },
+     "mappings": [],
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value",
+    "justifyMode": "auto",
+    "orientation": "auto",
+    "wideLayout": true,
+    "showPercentChange": false,
+    "text": {
+     "valueSize": 34
+    }
+   }
+  },
+  {
+   "type": "table",
+   "title": "Active alerts",
+   "id": 3,
+   "description": "Alerts from Prometheus (monitoring/alerts.yml), firing or pending. On every graph below, firing alerts are shaded red (critical), amber (warning) or blue (info), and chaos/load events from scripts/chaos.sh and scripts/load.sh are purple markers.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 21,
+    "x": 3,
+    "y": 1
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "max by (alertname, severity, worker_id, summary, alertstate) (ALERTS) * 0 + on (alertname, severity, worker_id, summary) group_left () (max by (alertname, severity, worker_id, summary) (ALERTS_FOR_STATE) * 1000)",
+     "format": "table",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "legendFormat": "__auto"
+    }
+   ],
+   "transformations": [
+    {
+     "id": "organize",
+     "options": {
+      "excludeByName": {
+       "Time": true
+      },
+      "indexByName": {
+       "severity": 0,
+       "alertname": 1,
+       "worker_id": 2,
+       "summary": 3,
+       "alertstate": 4,
+       "Value": 5
+      },
+      "renameByName": {
+       "severity": "Severity",
+       "alertname": "Alert",
+       "worker_id": "Worker",
+       "summary": "What it means",
+       "alertstate": "State",
+       "Value": "Active since"
+      }
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "align": "left",
+      "cellOptions": {
+       "type": "auto"
+      },
+      "inspect": false
+     },
+     "noValue": "All clear: no alerts firing or pending",
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "mappings": [],
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Severity"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "critical": {
+            "text": "critical",
+            "color": "#d03b3b",
+            "index": 0
+           },
+           "warning": {
+            "text": "warning",
+            "color": "#fab219",
+            "index": 1
+           },
+           "info": {
+            "text": "info",
+            "color": "#7aa2e0",
+            "index": 2
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.width",
+        "value": 90
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Alert"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 200
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Worker"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 90
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "State"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "firing": {
+            "text": "firing",
+            "color": "text",
+            "index": 0
+           },
+           "pending": {
+            "text": "pending",
+            "color": "#8e8e8e",
+            "index": 1
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Active since"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeFromNow"
+       },
+       {
+        "id": "custom.width",
+        "value": 160
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "footer": {
+     "show": false
+    },
+    "sortBy": [
+     {
+      "displayName": "Active since",
+      "desc": true
+     }
+    ]
+   }
+  },
+  {
+   "type": "row",
+   "title": "Cluster overview",
+   "id": 4,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 7
+   },
+   "panels": []
+  },
+  {
+   "type": "stat",
+   "title": "Workers alive",
+   "id": 5,
    "description": "Workers not marked DEAD by the controller (heartbeat within the timeout). 2 are needed to accept uploads.",
    "datasource": {
     "type": "prometheus",
@@ -70,7 +475,7 @@
     "h": 4,
     "w": 3,
     "x": 0,
-    "y": 1
+    "y": 8
    },
    "targets": [
     {
@@ -134,7 +539,7 @@
   {
    "type": "stat",
    "title": "Under-replicated",
-   "id": 3,
+   "id": 6,
    "description": "Committed chunks with fewer than 2 HEALTHY replicas on live workers. Should return to 0 after repair.",
    "datasource": {
     "type": "prometheus",
@@ -144,7 +549,7 @@
     "h": 4,
     "w": 3,
     "x": 3,
-    "y": 1
+    "y": 8
    },
    "targets": [
     {
@@ -204,7 +609,7 @@
   {
    "type": "stat",
    "title": "Unavailable",
-   "id": 4,
+   "id": 7,
    "description": "Committed chunks with no readable replica on a live worker. Downloads touching them fail with 503.",
    "datasource": {
     "type": "prometheus",
@@ -214,7 +619,7 @@
     "h": 4,
     "w": 3,
     "x": 6,
-    "y": 1
+    "y": 8
    },
    "targets": [
     {
@@ -274,7 +679,7 @@
   {
    "type": "stat",
    "title": "Active repairs",
-   "id": 5,
+   "id": 8,
    "description": "Repair tasks queued or running.",
    "datasource": {
     "type": "prometheus",
@@ -284,7 +689,7 @@
     "h": 4,
     "w": 3,
     "x": 9,
-    "y": 1
+    "y": 8
    },
    "targets": [
     {
@@ -344,7 +749,7 @@
   {
    "type": "stat",
    "title": "Objects",
-   "id": 6,
+   "id": 9,
    "description": "COMMITTED objects.",
    "datasource": {
     "type": "prometheus",
@@ -354,7 +759,7 @@
     "h": 4,
     "w": 3,
     "x": 12,
-    "y": 1
+    "y": 8
    },
    "targets": [
     {
@@ -410,7 +815,7 @@
   {
    "type": "stat",
    "title": "Stored data",
-   "id": 7,
+   "id": 10,
    "description": "Logical size of committed objects (each byte is stored twice).",
    "datasource": {
     "type": "prometheus",
@@ -420,7 +825,7 @@
     "h": 4,
     "w": 3,
     "x": 15,
-    "y": 1
+    "y": 8
    },
    "targets": [
     {
@@ -476,7 +881,7 @@
   {
    "type": "stat",
    "title": "Chunks",
-   "id": 8,
+   "id": 11,
    "description": "Chunks of committed objects (1 MiB each, last one smaller).",
    "datasource": {
     "type": "prometheus",
@@ -486,7 +891,7 @@
     "h": 4,
     "w": 3,
     "x": 18,
-    "y": 1
+    "y": 8
    },
    "targets": [
     {
@@ -542,7 +947,7 @@
   {
    "type": "stat",
    "title": "Healthy replicas",
-   "id": 9,
+   "id": 12,
    "description": "HEALTHY replica rows; 2 per chunk when fully replicated (briefly more while surplus copies are trimmed).",
    "datasource": {
     "type": "prometheus",
@@ -552,7 +957,7 @@
     "h": 4,
     "w": 3,
     "x": 21,
-    "y": 1
+    "y": 8
    },
    "targets": [
     {
@@ -608,7 +1013,7 @@
   {
    "type": "state-timeline",
    "title": "Reachability",
-   "id": 10,
+   "id": 13,
    "description": "Whether Prometheus can scrape each process (postgres: whether the controller can query it). A stopped container turns red within one scrape (5 s).",
    "datasource": {
     "type": "prometheus",
@@ -618,7 +1023,7 @@
     "h": 7,
     "w": 12,
     "x": 0,
-    "y": 5
+    "y": 12
    },
    "targets": [
     {
@@ -722,7 +1127,7 @@
   {
    "type": "state-timeline",
    "title": "Worker state (controller's view)",
-   "id": 11,
+   "id": 14,
    "description": "HEALTHY / DEGRADED / DEAD as stored in PostgreSQL (DEAD only after the heartbeat timeout, 15 s). Draining: being emptied by the rebalancer before removal.",
    "datasource": {
     "type": "prometheus",
@@ -732,7 +1137,7 @@
     "h": 7,
     "w": 12,
     "x": 12,
-    "y": 5
+    "y": 12
    },
    "targets": [
     {
@@ -864,20 +1269,20 @@
   {
    "type": "row",
    "title": "Workers",
-   "id": 12,
+   "id": 15,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 12
+    "y": 19
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "Heartbeat age",
-   "id": 13,
+   "id": 16,
    "description": "Seconds since each worker's last heartbeat. Dashed red line = DEAD threshold (15 s).",
    "datasource": {
     "type": "prometheus",
@@ -887,7 +1292,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 13
+    "y": 20
    },
    "targets": [
     {
@@ -1064,7 +1469,7 @@
   {
    "type": "timeseries",
    "title": "Healthy replicas per worker",
-   "id": 14,
+   "id": 17,
    "description": "Chunk copies each worker holds (controller's records). Watch them move when a worker dies and is repaired, and converge when the rebalancer fills a new worker.",
    "datasource": {
     "type": "prometheus",
@@ -1074,7 +1479,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 13
+    "y": 20
    },
    "targets": [
     {
@@ -1244,7 +1649,7 @@
   {
    "type": "bargauge",
    "title": "Replica data per worker",
-   "id": 15,
+   "id": 18,
    "description": "Bytes of HEALTHY chunk replicas per worker.",
    "datasource": {
     "type": "prometheus",
@@ -1254,7 +1659,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 13
+    "y": 20
    },
    "targets": [
     {
@@ -1406,7 +1811,7 @@
   {
    "type": "timeseries",
    "title": "Chunk files on disk",
-   "id": 16,
+   "id": 19,
    "description": "Files actually present on each worker volume (worker's own view; includes copies awaiting trim/delete).",
    "datasource": {
     "type": "prometheus",
@@ -1416,7 +1821,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 21
+    "y": 28
    },
    "targets": [
     {
@@ -1586,7 +1991,7 @@
   {
    "type": "timeseries",
    "title": "Chunk I/O  \u00b7  write \u2191  read \u2193",
-   "id": 17,
+   "id": 20,
    "description": "Bytes/s written (above zero) and read (below zero, dashed) per worker.",
    "datasource": {
     "type": "prometheus",
@@ -1596,7 +2001,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 21
+    "y": 28
    },
    "targets": [
     {
@@ -1794,7 +2199,7 @@
   {
    "type": "timeseries",
    "title": "Rebalancing  \u00b7  per min",
-   "id": 18,
+   "id": 21,
    "description": "Replicas moved from the fullest to the emptiest worker (e.g. after worker5 joins). Each move copies and verifies first, then retires the old copy, so a chunk never has fewer than 2 copies. Paused while repairs run.",
    "datasource": {
     "type": "prometheus",
@@ -1804,7 +2209,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 21
+    "y": 28
    },
    "targets": [
     {
@@ -1919,20 +2324,20 @@
   {
    "type": "row",
    "title": "Replication and repair",
-   "id": 19,
+   "id": 22,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 29
+    "y": 36
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "Replication health",
-   "id": 20,
+   "id": 23,
    "description": "Rises when a worker dies or a copy is found bad; falls back to 0 as repairs complete.",
    "datasource": {
     "type": "prometheus",
@@ -1942,7 +2347,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 30
+    "y": 37
    },
    "targets": [
     {
@@ -2057,7 +2462,7 @@
   {
    "type": "timeseries",
    "title": "Repair queue",
-   "id": 21,
+   "id": 24,
    "description": "Durable repair tasks in PostgreSQL by state.",
    "datasource": {
     "type": "prometheus",
@@ -2067,7 +2472,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 30
+    "y": 37
    },
    "targets": [
     {
@@ -2207,7 +2612,7 @@
   {
    "type": "timeseries",
    "title": "Repair activity  \u00b7  per min",
-   "id": 22,
+   "id": 25,
    "description": "Repairs completed; copies are pushed directly between workers on the controller's command.",
    "datasource": {
     "type": "prometheus",
@@ -2217,7 +2622,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 30
+    "y": 37
    },
    "targets": [
     {
@@ -2382,7 +2787,7 @@
   {
    "type": "timeseries",
    "title": "Replicas not healthy",
-   "id": 23,
+   "id": 26,
    "description": "Replica rows by state, excluding HEALTHY.",
    "datasource": {
     "type": "prometheus",
@@ -2392,7 +2797,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 38
+    "y": 45
    },
    "targets": [
     {
@@ -2557,7 +2962,7 @@
   {
    "type": "timeseries",
    "title": "Time to heal",
-   "id": 24,
+   "id": 27,
    "description": "From repair task queued to the chunk having 2 healthy replicas again (5 min window).",
    "datasource": {
     "type": "prometheus",
@@ -2567,7 +2972,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 38
+    "y": 45
    },
    "targets": [
     {
@@ -2682,7 +3087,7 @@
   {
    "type": "timeseries",
    "title": "Oldest active repair",
-   "id": 25,
+   "id": 28,
    "description": "How long the oldest unfinished repair has waited. Keeps growing if no healthy source exists.",
    "datasource": {
     "type": "prometheus",
@@ -2692,7 +3097,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 38
+    "y": 45
    },
    "targets": [
     {
@@ -2766,20 +3171,20 @@
   {
    "type": "row",
    "title": "Data integrity",
-   "id": 26,
+   "id": 29,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 46
+    "y": 53
    },
    "panels": []
   },
   {
    "type": "stat",
    "title": "Corrupt copies detected",
-   "id": 27,
+   "id": 30,
    "description": "Replicas moved to CORRUPT since the controller started (read-time check, scrubber or repair source check).",
    "datasource": {
     "type": "prometheus",
@@ -2789,7 +3194,7 @@
     "h": 5,
     "w": 4,
     "x": 0,
-    "y": 47
+    "y": 54
    },
    "targets": [
     {
@@ -2849,7 +3254,7 @@
   {
    "type": "stat",
    "title": "Missing copies detected",
-   "id": 28,
+   "id": 31,
    "description": "Replicas moved to MISSING since the controller started (404 on read, scrubber, inventory reconciliation).",
    "datasource": {
     "type": "prometheus",
@@ -2859,7 +3264,7 @@
     "h": 5,
     "w": 4,
     "x": 4,
-    "y": 47
+    "y": 54
    },
    "targets": [
     {
@@ -2919,7 +3324,7 @@
   {
    "type": "stat",
    "title": "Read fallbacks",
-   "id": 29,
+   "id": 32,
    "description": "Chunk reads that switched to the other replica; the client still got verified bytes.",
    "datasource": {
     "type": "prometheus",
@@ -2929,7 +3334,7 @@
     "h": 5,
     "w": 4,
     "x": 8,
-    "y": 47
+    "y": 54
    },
    "targets": [
     {
@@ -2985,7 +3390,7 @@
   {
    "type": "bargauge",
    "title": "Since last scrub pass",
-   "id": 30,
+   "id": 33,
    "description": "Time since each worker's last complete scrub pass (SCRUB_INTERVAL is 30 min).",
    "datasource": {
     "type": "prometheus",
@@ -2995,7 +3400,7 @@
     "h": 5,
     "w": 6,
     "x": 12,
-    "y": 47
+    "y": 54
    },
    "targets": [
     {
@@ -3060,7 +3465,7 @@
   {
    "type": "bargauge",
    "title": "Scrub report queue",
-   "id": 31,
+   "id": 34,
    "description": "Findings stored durably on the worker, waiting for the controller to acknowledge them.",
    "datasource": {
     "type": "prometheus",
@@ -3070,7 +3475,7 @@
     "h": 5,
     "w": 6,
     "x": 18,
-    "y": 47
+    "y": 54
    },
    "targets": [
     {
@@ -3130,7 +3535,7 @@
   {
    "type": "timeseries",
    "title": "Corruption and loss events  \u00b7  per min",
-   "id": 32,
+   "id": 35,
    "description": "Every path that detects bad data. Each one leads to a repair task.",
    "datasource": {
     "type": "prometheus",
@@ -3140,7 +3545,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 52
+    "y": 59
    },
    "targets": [
     {
@@ -3330,7 +3735,7 @@
   {
    "type": "timeseries",
    "title": "Scrubber throughput",
-   "id": 33,
+   "id": 36,
    "description": "Bytes/s re-hashed by the background scrubbers, stacked (rate limited by SCRUB_RATE_MB_S).",
    "datasource": {
     "type": "prometheus",
@@ -3340,7 +3745,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 52
+    "y": 59
    },
    "targets": [
     {
@@ -3510,20 +3915,20 @@
   {
    "type": "row",
    "title": "Client traffic",
-   "id": 34,
+   "id": 37,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 60
+    "y": 67
    },
    "panels": []
   },
   {
    "type": "timeseries",
    "title": "Throughput",
-   "id": 35,
+   "id": 38,
    "description": "Bytes/s through the controller's client API. Upload bytes are counted when an object commits.",
    "datasource": {
     "type": "prometheus",
@@ -3533,7 +3938,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 61
+    "y": 68
    },
    "targets": [
     {
@@ -3648,7 +4053,7 @@
   {
    "type": "timeseries",
    "title": "Requests  \u00b7  per min",
-   "id": 36,
+   "id": 39,
    "description": "",
    "datasource": {
     "type": "prometheus",
@@ -3658,7 +4063,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 61
+    "y": 68
    },
    "targets": [
     {
@@ -3873,7 +4278,7 @@
   {
    "type": "timeseries",
    "title": "Latency",
-   "id": 37,
+   "id": 40,
    "description": "End-to-end request time (2 min window); p95 dashed. Upload includes replication of every chunk.",
    "datasource": {
     "type": "prometheus",
@@ -3883,7 +4288,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 61
+    "y": 68
    },
    "targets": [
     {
@@ -4066,7 +4471,7 @@
   {
    "type": "timeseries",
    "title": "Chain replication",
-   "id": 38,
+   "id": 41,
    "description": "The controller uploads each chunk once; the first worker forwards the second copy. 'sends' = 'forwards ok' means no chunk crossed the controller twice.",
    "datasource": {
     "type": "prometheus",
@@ -4076,7 +4481,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 69
+    "y": 76
    },
    "targets": [
     {
@@ -4216,7 +4621,7 @@
   {
    "type": "timeseries",
    "title": "Concurrency (controller gates)",
-   "id": 39,
+   "id": 42,
    "description": "Bounded concurrency: in-flight work and requests waiting for a slot (dashed).",
    "datasource": {
     "type": "prometheus",
@@ -4226,7 +4631,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 69
+    "y": 76
    },
    "targets": [
     {
@@ -4399,7 +4804,7 @@
   {
    "type": "timeseries",
    "title": "Worker transfer slots",
-   "id": 40,
+   "id": 43,
    "description": "Per-worker bounded concurrency for chunk reads/writes (backpressure). Waiting = dashed.",
    "datasource": {
     "type": "prometheus",
@@ -4409,7 +4814,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 69
+    "y": 76
    },
    "targets": [
     {
@@ -4607,7 +5012,7 @@
   {
    "type": "timeseries",
    "title": "Hedged reads  \u00b7  per min",
-   "id": 41,
+   "id": 44,
    "description": "A chunk read slower than the hedge delay also asks the other replica; the first verified answer wins and the other request is cancelled. Wins \u2248 sent means a replica is slow or hung.",
    "datasource": {
     "type": "prometheus",
@@ -4617,7 +5022,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 77
+    "y": 84
    },
    "targets": [
     {
@@ -4782,7 +5187,7 @@
   {
    "type": "timeseries",
    "title": "Hedge delay (adaptive)",
-   "id": 42,
+   "id": 45,
    "description": "p95 of recent chunk reads, clamped to READ_HEDGE_MIN_DELAY..READ_HEDGE_MAX_DELAY: only the slowest ~5% of reads trigger a second request.",
    "datasource": {
     "type": "prometheus",
@@ -4792,7 +5197,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 77
+    "y": 84
    },
    "targets": [
     {
@@ -4866,19 +5271,19 @@
   {
    "type": "row",
    "title": "Caches",
-   "id": 43,
+   "id": 46,
    "collapsed": true,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 85
+    "y": 92
    },
    "panels": [
     {
      "type": "timeseries",
      "title": "Cache hit ratio",
-     "id": 44,
+     "id": 47,
      "description": "Hits / (hits + misses) over 1 min. Empty when there are no reads.",
      "datasource": {
       "type": "prometheus",
@@ -4888,7 +5293,7 @@
       "h": 8,
       "w": 12,
       "x": 0,
-      "y": 86
+      "y": 93
      },
      "targets": [
       {
@@ -5083,7 +5488,7 @@
     {
      "type": "timeseries",
      "title": "Chunk cache memory",
-     "id": 45,
+     "id": 48,
      "description": "Bytes held by each worker's RAM chunk cache (budget CHUNK_CACHE_BYTES).",
      "datasource": {
       "type": "prometheus",
@@ -5093,7 +5498,7 @@
       "h": 8,
       "w": 8,
       "x": 12,
-      "y": 86
+      "y": 93
      },
      "targets": [
       {
@@ -5263,7 +5668,7 @@
     {
      "type": "stat",
      "title": "Metadata cache entries",
-     "id": 46,
+     "id": 49,
      "description": "Objects cached by the controller's metadata cache (META_CACHE_SIZE).",
      "datasource": {
       "type": "prometheus",
@@ -5273,7 +5678,7 @@
       "h": 8,
       "w": 4,
       "x": 20,
-      "y": 86
+      "y": 93
      },
      "targets": [
       {

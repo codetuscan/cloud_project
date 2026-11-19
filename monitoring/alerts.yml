@@ -1,0 +1,136 @@
+# Prometheus alert rules for the object store (loaded via rule_files in prometheus.yml).
+#
+# Every rule carries:
+#   severity  critical = clients are or will be affected now; warning = redundancy or upkeep is degraded;
+#             info     = a notable event (bad copy found, a replica is slow) that the system is already handling
+#   summary   a short, fixed sentence, as a LABEL so Grafana's "Active alerts" table and the red/amber markers on
+#             the graphs can show it (Prometheus does not export annotations to ALERTS)
+# Firing alerts appear at http://localhost:9090/alerts and on the Grafana dashboard. No Alertmanager is configured:
+# nothing is paged or emailed, the alerts are for watching the system.
+#
+# Check the file:  docker compose exec prometheus promtool check rules /etc/prometheus/alerts.yml
+groups:
+  - name: objstore
+    interval: 5s
+    rules:
+      # ------------------------------------------------------------------ processes
+      - alert: ControllerDown
+        expr: up{job="controller"} == 0
+        for: 10s
+        labels: {severity: critical, summary: "Controller not answering; no uploads or downloads possible"}
+        annotations:
+          description: "Prometheus cannot scrape the controller ({{ $labels.instance }}). Clients get connection errors."
+
+      - alert: DatabaseDown
+        expr: objstore_database_up == 0
+        for: 10s
+        labels: {severity: critical, summary: "Controller cannot reach PostgreSQL"}
+        annotations:
+          description: "Metadata is unavailable: uploads, downloads and repairs are failing."
+
+      - alert: WorkerDown
+        # The controller already waits HEARTBEAT_TIMEOUT (15 s) before marking a worker DEAD, so no extra 'for'.
+        # A worker that was drained first is expected to be stopped: see WorkerDrainedAndStopped.
+        expr: objstore_worker_alive == 0 unless on (worker_id) objstore_worker_draining == 1
+        labels: {severity: critical, summary: "Worker DEAD (no heartbeat); its copies are being re-replicated"}
+        annotations:
+          description: "{{ $labels.worker_id }} missed heartbeats for HEARTBEAT_TIMEOUT. Chunks it held have one copy left until repair copies them elsewhere."
+
+      - alert: WorkerDrainedAndStopped
+        expr: objstore_worker_alive == 0 and on (worker_id) objstore_worker_draining == 1
+        labels: {severity: info, summary: "Drained worker stopped; remove it with DELETE /internal/workers/<id>"}
+        annotations:
+          description: "{{ $labels.worker_id }} was drained and is now DEAD, as expected during scale-in."
+
+      - alert: WorkerNotResponding
+        # Heartbeats still arrive but /metrics does not answer (overloaded, hung handler). Only workers the
+        # controller knows and considers alive: a DEAD one is WorkerDown, an unregistered target is ignored.
+        expr: up{job="workers"} == 0 and on (worker_id) objstore_worker_alive == 1
+        for: 30s
+        labels: {severity: warning, summary: "Worker alive but not answering requests"}
+        annotations:
+          description: "{{ $labels.worker_id }} still sends heartbeats but Prometheus cannot scrape it."
+
+      - alert: WorkerLowDisk
+        expr: objstore_worker_state{state="DEGRADED"} == 1
+        for: 30s
+        labels: {severity: warning, summary: "Worker below 5% free disk; no new data is placed on it"}
+        annotations:
+          description: "{{ $labels.worker_id }} is DEGRADED (low disk). It keeps serving reads."
+
+      # ------------------------------------------------------------------ redundancy
+      - alert: ChunksUnavailable
+        expr: objstore_unavailable_chunks > 0
+        for: 10s
+        labels: {severity: critical, summary: "Some chunks have NO readable copy; downloads of them fail"}
+        annotations:
+          description: "{{ $value }} committed chunk(s) have no HEALTHY replica on a live worker."
+
+      - alert: ChunksUnderReplicated
+        expr: objstore_under_replicated_chunks > 0
+        for: 1m
+        labels: {severity: warning, summary: "Chunks with fewer than 2 healthy copies for over 1 min"}
+        annotations:
+          description: "{{ $value }} chunk(s) are one failure away from being unavailable. Repair should bring this to 0."
+
+      - alert: RepairStuck
+        expr: objstore_repair_oldest_active_task_age_seconds > 300
+        labels: {severity: warning, summary: "A repair task has been unfinished for over 5 min"}
+        annotations:
+          description: "Oldest active repair is {{ $value | humanizeDuration }} old: no healthy source or no free target worker."
+
+      - alert: DataLost
+        expr: increase(objstore_repairs_unrecoverable_total[15m]) > 0
+        labels: {severity: critical, summary: "A repair found no healthy copy anywhere (data loss)"}
+        annotations:
+          description: "At least one chunk could not be repaired in the last 15 min. See repair_tasks with state UNRECOVERABLE."
+
+      # ------------------------------------------------------------------ integrity
+      - alert: CorruptReplicaDetected
+        expr: increase(objstore_replicas_marked_corrupt_total[2m]) > 0
+        labels: {severity: info, summary: "A corrupt copy was found and is being repaired"}
+        annotations:
+          description: "A replica failed its checksum (read check, scrubber or repair). A repair task replaces it."
+
+      - alert: MissingReplicaDetected
+        expr: increase(objstore_replicas_marked_missing_total[2m]) > 0
+        labels: {severity: info, summary: "A chunk file was missing on a worker and is being repaired"}
+        annotations:
+          description: "A replica recorded as HEALTHY was not on the worker's disk. A repair task restores it."
+
+      - alert: ScrubOverdue
+        # No complete scrub pass in 2 x SCRUB_INTERVAL + 10 min (or none at all since the worker started).
+        expr: >
+          time() - objstore_scrub_last_finished_timestamp_seconds > 2 * objstore_scrub_interval_seconds + 600
+          or (objstore_uptime_seconds{job="workers"} > 2 * objstore_scrub_interval_seconds + 600
+              unless objstore_scrub_last_finished_timestamp_seconds)
+        labels: {severity: warning, summary: "Scrubber has not finished a pass in 2x SCRUB_INTERVAL"}
+        annotations:
+          description: "Bit rot on {{ $labels.worker_id }} could go unnoticed: the background scrubber is overdue."
+
+      - alert: ScrubReportsUndelivered
+        expr: objstore_scrub_report_queue_depth > 0
+        for: 5m
+        labels: {severity: warning, summary: "Worker cannot deliver scrub findings to the controller"}
+        annotations:
+          description: "{{ $value }} finding(s) queued on {{ $labels.worker_id }} for over 5 min (kept durably, retried)."
+
+      # ------------------------------------------------------------------ clients
+      - alert: UploadsCannotReplicate
+        expr: increase(objstore_uploads_pending_503_total[2m]) > 0
+        labels: {severity: warning, summary: "Uploads answered 503: fewer than 2 workers could take a copy"}
+        annotations:
+          description: "Uploads are kept in staging and retried; clients see 503 until 2 workers are HEALTHY."
+
+      - alert: ServerBusy
+        expr: sum(increase(objstore_gate_rejected_total{job="controller"}[1m])) > 0
+        labels: {severity: warning, summary: "Clients rejected with 503 server_busy (concurrency limit)"}
+        annotations:
+          description: "Upload or download gates were full for longer than the wait limit."
+
+      - alert: ReplicaSlow
+        # Most hedged reads won by the second copy: one replica is answering slowly or not at all.
+        expr: increase(objstore_read_hedge_wins_total[1m]) >= 3
+        labels: {severity: info, summary: "A replica is slow; reads are served by the other copy (hedging)"}
+        annotations:
+          description: "{{ $value }} chunk reads in the last minute were answered by the hedge request."

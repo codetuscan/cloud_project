@@ -5,7 +5,8 @@ controller (POST /internal/workers/scrub-results), which decides and coordinates
 
 * Walks local chunk files with 64 KiB reads, one chunk at a time, rate limited (SCRUB_RATE_MB_S)
   so it can't starve foreground reads/writes.
-* Start time is staggered per worker (hash of worker id) so the four workers don't scan together.
+* Passes run SCRUB_INTERVAL after the previous one finished (wall clock, survives restarts); the first pass of
+  a never-scrubbed worker is staggered per worker (hash of worker id) so the four workers don't scan together.
 * Findings are written to a durable on-disk queue (one fsynced file per report) and removed only
   after the controller acknowledges them, so a controller outage loses nothing.
 * Progress/counters are persisted to DATA_DIR/scrub_state.json.
@@ -214,18 +215,42 @@ async def run_pass(client: httpx.AsyncClient) -> None:
              state["unreadable_found"], state["duration_seconds"])
 
 
+def _last_finished_epoch() -> float | None:
+    try:
+        return datetime.fromisoformat(state["last_scrub_finished"]).timestamp() if state["last_scrub_finished"] else None
+    except ValueError:
+        return None
+
+
+def first_due(now: float, offset: float) -> float:
+    """Wall-clock time of the first pass after start-up.
+
+    Never scrubbed: staggered by `offset` inside the interval. Otherwise one interval after the last pass FINISHED
+    (persisted in scrub_state.json), so a restart neither postpones a due pass by up to another interval nor
+    scrubs again right after a pass; an overdue pass starts within a minute (still staggered per worker).
+    """
+    last = _last_finished_epoch()
+    if last is None:
+        return now + offset
+    return max(last + settings.scrub_interval, now + offset % 60)
+
+
 async def scrub_loop() -> None:
     await asyncio.to_thread(load_state)
     # stagger: each worker starts at a different offset inside the interval
     offset = zlib.crc32(settings.worker_id.encode()) % max(1, int(settings.scrub_interval))
-    log.info("scrubber: interval=%.0fs, first pass in %ds (staggered)", settings.scrub_interval, offset)
+    due = first_due(time.time(), offset)
+    log.info("scrubber: interval=%.0fs, next pass in %.0fs", settings.scrub_interval, max(0.0, due - time.time()))
     async with httpx.AsyncClient(base_url=settings.controller_url, timeout=5.0) as client:
-        wait = float(offset)
         while True:
-            try:
-                await asyncio.wait_for(trigger.wait(), timeout=wait)
-            except asyncio.TimeoutError:
-                pass
+            # Wait on the wall clock in short steps: asyncio timers use the monotonic clock, which stops while
+            # the host is suspended, so one long sleep could overshoot the schedule by the suspended time.
+            remaining = due - time.time()
+            if remaining > 0 and not trigger.is_set():
+                try:
+                    await asyncio.wait_for(trigger.wait(), timeout=min(remaining, 30.0))
+                except asyncio.TimeoutError:
+                    continue
             trigger.clear()
             try:
                 await run_pass(client)
@@ -234,7 +259,7 @@ async def scrub_loop() -> None:
             except Exception:
                 state["in_progress"] = False
                 log.exception("scrub pass crashed")
-            wait = settings.scrub_interval
+            due = time.time() + settings.scrub_interval
 
 
 # ---------------------------------------------------------------- report delivery

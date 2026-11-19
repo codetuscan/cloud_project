@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime
 
 from app.common import metrics
+from app.common.config import settings
 from app.common.prom import Exposition
 from app.worker import cache as wcache
 from app.worker import disk, scrub
@@ -61,6 +62,8 @@ async def render(transfers_gate) -> str:
 
     s = scrub.state
     e.gauge("scrub_in_progress", bool(s["in_progress"]), "1 while a scrub pass is running.")
+    e.gauge("scrub_interval_seconds", settings.scrub_interval,
+            "Configured time between scrub passes (SCRUB_INTERVAL); the ScrubOverdue alert is relative to it.")
     e.gauge("scrub_passes_completed", s["passes_completed"], "Scrub passes completed (persisted across restarts).")
     e.gauge("scrub_last_pass_chunks_total", s["chunks_total"], "Chunks in the current/last pass.")
     e.gauge("scrub_last_pass_chunks_checked", s["chunks_checked"], "Chunks checked so far in the current/last pass.")

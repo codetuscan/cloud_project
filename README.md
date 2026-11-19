@@ -90,11 +90,12 @@ docker compose logs -f controller                                     # repair /
 |---|---|
 | Grafana dashboard "Object Store" (opens without login, read-only; admin / `GRAFANA_ADMIN_PASSWORD` to edit) | http://localhost:3000 |
 | Prometheus (raw queries, target health under *Status → Targets*) | http://localhost:9090 |
+| Prometheus alerts (rules in `monitoring/alerts.yml`) | http://localhost:9090/alerts |
 | Jaeger: request traces, one timeline per upload/download/repair across controller and workers | http://localhost:16686 |
 | Raw metrics, Prometheus text format | `curl -s localhost:8090/metrics` · `docker exec worker1 curl -s localhost:9000/metrics` |
 
 Prometheus scrapes the controller and the four workers every 5 s. The dashboard (refreshes every 5 s) shows, in rows:
-cluster overview (workers alive, under-replicated/unavailable chunks, objects, reachability and worker-state
+alerts (firing count and a table of active alerts with what each one means) · cluster overview (workers alive, under-replicated/unavailable chunks, objects, reachability and worker-state
 timelines) · workers (heartbeat age, replicas and bytes per worker, chunk I/O) · replication and repair (repair queue,
 repairs per minute, time to heal) · data integrity (corrupt/missing copies detected, scrubber activity, report queue) ·
 client traffic (throughput, request rates, p50/p95 latency, chain replication) · caches (hit ratio, memory;
@@ -102,6 +103,48 @@ collapsed by default). Each worker keeps the same colour in every panel; amber a
 needs attention.
 Keep it open while running `./scripts/demo/05_worker_failure.sh` or `06_data_integrity.sh` to watch a failure being
 detected and repaired. The object store does not depend on the monitoring containers; they can be stopped at any time.
+
+### Alerts, traffic generator and chaos
+
+**Alerts.** Prometheus evaluates 17 rules from `monitoring/alerts.yml` every 5 s. A firing alert is drawn across every
+graph of the dashboard: a red band for critical, amber for warning, a short blue marker for info, each labelled with
+the alert and worker (e.g. `WorkerDown worker2`). The "Active alerts" table at the top lists what is firing now and
+since when. No Alertmanager is configured: nothing is emailed or paged.
+
+| Severity | Alerts |
+|---|---|
+| critical | `ControllerDown`, `DatabaseDown`, `WorkerDown`, `ChunksUnavailable` (a chunk has no readable copy), `DataLost` |
+| warning | `ChunksUnderReplicated` (for > 1 min), `RepairStuck` (> 5 min), `ScrubOverdue` (no pass in 2 × `SCRUB_INTERVAL`), `ScrubReportsUndelivered`, `WorkerNotResponding`, `WorkerLowDisk`, `UploadsCannotReplicate`, `ServerBusy` |
+| info | `CorruptReplicaDetected`, `MissingReplicaDetected`, `ReplicaSlow` (reads served by the hedge), `WorkerDrainedAndStopped` |
+
+The rules have unit tests (no cluster needed):
+`docker run --rm --entrypoint promtool -v $PWD/monitoring:/m:ro -w /m prom/prometheus:v2.53.0 test rules alerts_test.yml`
+
+**Traffic generator.** `python3 scripts/load.py` keeps a few clients uploading, downloading, reading ranges and
+deleting, so the graphs move. Every download is checked byte for byte against what was uploaded, and it prints a line
+every 5 s (ops/s, failures and why, p50/p95). Ctrl-C prints a summary and deletes its objects (`load-*`).
+Options: `--clients 6`, `--duration 300`, `--max-size 8` (MiB), `--objects 25`, `--keep`, `--cleanup`.
+
+**Chaos.** `./scripts/chaos.sh` injects one fault at a time, waits for the system to detect and heal it, prints the
+times and moves on (default: a random fault every 60 s until Ctrl-C).
+
+| Fault | What it does | What you should see |
+|---|---|---|
+| `stop` | `docker stop` a random worker for 45 s | `WorkerDown` after ~15 s, chunks re-replicated with it still down, extra copies trimmed after it returns |
+| `pause` | freeze a worker for 8 s | reads answered by the other copy (`ReplicaSlow`), worker not marked DEAD |
+| `corrupt` | overwrite 5 bytes in one chunk file | `CorruptReplicaDetected`, copy rebuilt from the healthy replica in seconds |
+| `delete` | remove one chunk file | `MissingReplicaDetected`, file restored |
+| `controller` | `docker restart controller` | API back in ~2 s, no data lost |
+
+`corrupt` and `delete` only touch a test object the script uploads itself and verifies after every fault, never your
+own objects. Each fault is a purple band on the dashboard from injection to healed. Ctrl-C restarts or unpauses anything it
+touched and prints a summary table. Options: `--faults corrupt,delete`, `--rounds 5`, `--interval 30`,
+`--downtime 60`, `--list`. A good demo: run both side by side with the dashboard open.
+
+```bash
+python3 scripts/load.py &          # traffic (or in a second terminal)
+./scripts/chaos.sh --rounds 5      # five faults, each detected and healed
+```
 
 ### Request tracing (OpenTelemetry + Jaeger)
 
@@ -173,7 +216,7 @@ Copy `.env.example` to `.env` to change defaults; `docker-compose.yml` passes th
 ## 5. Tests and demonstrations
 
 ```bash
-./scripts/run_unit_tests.sh                 # 143 pytest unit tests, no cluster needed
+./scripts/run_unit_tests.sh                 # 150 pytest unit tests, no cluster needed
 ./scripts/demo/run_all.sh                   # the six demonstrations required by the course (narrated)
 ./scripts/demo/07_scale_out_and_in.sh       # extra: add worker5, rebalance, drain, remove
 ./scripts/demo/08_slow_worker_and_ranges.sh # extra: hung worker -> hedged reads; partial downloads
@@ -197,9 +240,10 @@ app/controller/     api.py (public API) · upload.py · placement.py · repair.p
                     drains leaving ones) · prom_metrics.py (/metrics)
 app/worker/         api.py (chunk API) · disk.py (atomic storage) · scrub.py · cache.py · agent.py · main.py
                     prom_metrics.py (/metrics)
-monitoring/         prometheus.yml · grafana/provisioning (datasource, dashboard provider)
+monitoring/         prometheus.yml · alerts.yml (alert rules) + alerts_test.yml · grafana/provisioning
                     grafana/dashboards/objstore.json · grafana/generate_dashboard.py (regenerates the JSON)
-scripts/            phase*_test.sh · demo/ · run_all_tests.sh · clean_start.sh · cache_benchmark.sh
+scripts/            phase*_test.sh · demo/ · load.py (traffic) · chaos.sh (fault injection) · run_all_tests.sh ·
+                    clean_start.sh · cache_benchmark.sh
 tests/              pytest unit tests
 ```
 

@@ -1,0 +1,500 @@
+
+################ unit tests
+ Image objstore-controller Building 
+ Image objstore-controller Built 
+ Container objstore-controller-run-b0d203a81c39 Creating 
+ Container objstore-controller-run-b0d203a81c39 Created 
+........................................................................ [ 79%]
+...................                                                      [100%]
+=============================== warnings summary ===============================
+../usr/local/lib/python3.12/site-packages/starlette/testclient.py:40
+  /usr/local/lib/python3.12/site-packages/starlette/testclient.py:40: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = typing.Callable[[], typing.ContextManager[anyio.abc.BlockingPortal]]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+91 passed, 1 warning in 1.28s
+
+################ phase 2+3 worker storage, heartbeats
+== Phase 2: worker chunk storage (worker1) ==
+  PASS: PUT new chunk -> 201
+  PASS: PUT same chunk again (idempotent) -> 200
+  PASS: PUT same id, different content -> 409
+  PASS: PUT body not matching checksum header -> 400
+  PASS: PUT without checksum header -> 400
+  PASS: path-traversal chunk id rejected (400/404)
+  PASS: GET returns identical bytes
+  PASS: inventory lists the chunk
+  -- corrupt the file on disk; GET must refuse to return bad bytes
+  PASS: GET of corrupted chunk -> 500 (not served)
+  -- restart worker1: data must persist
+  PASS: chunk still on disk after restart
+  PASS: DELETE chunk -> 204
+  PASS: GET deleted chunk -> 404
+== Phase 3: registration, heartbeat, failure detection ==
+  PASS: 4 workers registered HEALTHY
+  -- docker stop worker2; waiting for heartbeat timeout (~20s)
+  PASS: worker2 marked DEAD
+  -- docker start worker2
+  PASS: worker2 back to HEALTHY
+
+Result: 15 passed, 0 failed
+
+################ phase 4 upload path
+== Upload 5.5 MiB (expect 6 chunks, last = 0.5 MiB) ==
+  PASS: POST -> 201
+  PASS: state COMMITTED
+  PASS: chunk_count 6
+  PASS: object checksum = sha256 of file
+  PASS: size correct
+  PASS: name taken from filename
+  PASS: custom metadata stored
+  PASS: chunk order 0..5
+  PASS: last chunk is 524288 bytes
+  PASS: other chunks are 1048576 bytes
+  PASS: every chunk has 2 HEALTHY replicas
+  PASS: replicas are on different workers
+  chunk -> workers:
+    chunk 0 (1048576 B): worker1, worker2
+    chunk 1 (1048576 B): worker1, worker2
+    chunk 2 (1048576 B): worker1, worker2
+    chunk 3 (1048576 B): worker1, worker2
+    chunk 4 (1048576 B): worker3, worker4
+    chunk 5 (524288 B): worker3, worker4
+== Bytes really on the workers' disks ==
+    worker1 holds 4 chunks of this object
+    worker2 holds 4 chunks of this object
+    worker3 holds 2 chunks of this object
+    worker4 holds 2 chunks of this object
+  PASS: 12 replica files total on workers
+  PASS: chunks reassembled from workers == original
+  PASS: staging dir is empty after commit
+== Edge sizes ==
+  PASS: exact multiple of chunk size (2 MiB) -> 2 chunks
+  PASS: tiny file -> 1 chunk
+  PASS: content type kept
+== Validation errors ==
+  PASS: empty file -> 400
+  PASS: missing file field -> 400
+  PASS: bad metadata JSON -> 400
+  PASS: metadata not an object -> 400
+  PASS: non-multipart body -> 400
+  PASS: error body is JSON with message
+  PASS: metadata of unknown id -> 404
+== Idempotency-Key ==
+  PASS: first -> 201
+  PASS: retry -> 200 (no duplicate)
+  PASS: retry returns same object_id
+== Not enough workers: 503, upload kept in staging, auto-resumed ==
+  PASS: only 1 worker reachable -> 503
+  PASS: unfinished object is NOT visible yet (404)
+  PASS: staged file retained
+  waiting for workers to return and the resume loop (up to ~75s)...
+  PASS: upload auto-completed after workers returned
+  PASS: resumed object has 2 healthy replicas per chunk on different workers
+  PASS: staging cleaned after resume
+
+Result: 34 passed, 0 failed
+
+################ phase 5 download/list/patch/delete
+uploaded test object fa636494-49fd-458a-9581-c1d23c29b032
+== Download ==
+  PASS: 200 OK
+  PASS: download is byte-identical to original
+  PASS: Content-Length header
+  PASS: Content-Type header
+  PASS: Content-Disposition has filename
+  PASS: unknown object -> 404
+  PASS: malformed id -> 404
+== Read fallback: one replica worker stopped ==
+  stopping worker1 (holds a replica of chunk 0)
+  PASS: download still correct (3 tries) with worker1 down
+== Read fallback: corrupted replica on disk ==
+  corrupted chunk 1 (fa636494-49fd-458a-9581-c1d23c29b032-000001) on worker1
+  PASS: every download was byte-identical despite the corrupt replica
+  PASS: read detected it: repair task with a read-time reason exists (it may already be DONE: repair is fast)
+  PASS: the damaged replica ends up repaired (HEALTHY again)
+== Both replicas of a chunk gone: must fail, never truncate silently ==
+  PASS: request failed (http=200 curl_rc=18), not a quiet short file
+== List ==
+  PASS: limit=2 returns 2 items
+  PASS: next_cursor present
+  PASS: items have id,name,size,content_type
+  PASS: pagination: no duplicate ids
+  PASS: listed: fa636494-49fd-458a-9581-c1d23c29b032
+  PASS: listed: d8aa19ba-338d-42d0-89e0-414987b773c4
+  PASS: listed: f0c3314e-3242-4a31-9aac-40ed18fd4bfb
+  PASS: listed: 1f353c9a-f4c8-4d45-b585-6749cf24e337
+  PASS: limit=0 -> 400
+  PASS: limit=abc -> 400
+  PASS: bad cursor -> 400
+== PATCH metadata (no re-upload) ==
+  PASS: PATCH -> 200
+  PASS: key updated
+  PASS: key added
+  PASS: number kept
+  PASS: null removes key
+  PASS: last_modified advanced
+  PASS: data untouched (same checksum, chunks)
+  PASS: download after PATCH still identical
+  PASS: PATCH unknown id -> 404
+  PASS: PATCH invalid JSON -> 400
+  PASS: PATCH non-object -> 400
+  PASS: PATCH nested value -> 400
+== DELETE ==
+  PASS: DELETE -> 204
+  PASS: GET after delete -> 404
+  PASS: metadata after delete -> 404
+  PASS: not in list
+  PASS: second DELETE -> 404
+  PASS: DELETE unknown -> 404
+  PASS: chunk files removed from all workers
+  PASS: object state DELETED, no replica rows
+  PASS: tombstones kept
+  -- delete while a replica worker is down: retried until it returns
+  PASS: DELETE with worker1 down -> 204
+  PASS: object stays DELETING while worker1 is down
+  PASS: after worker1 returns -> DELETED
+  PASS: its chunk files are gone
+
+Result: 48 passed, 0 failed
+
+################ phase 6 failures + repair
+== Setup: fast reconcile/orphan timers for the test (controller restarts) ==
+  PASS: controller up (after ~3s)
+  test object 93a0967c-67a2-41d9-8ff4-96c42eab0aa8 (5 chunks)
+  PASS: baseline: every chunk has exactly 2 healthy replicas
+== 1. Worker failure -> re-replication ==
+  docker stop worker1
+  PASS: worker1 marked DEAD (after ~15s)
+  PASS: protection is reported degraded while repairing or just after
+  PASS: all chunks back to 2 healthy replicas on live workers (after ~3s)
+  PASS: download during outage is byte-identical
+  PASS: no chunk replica placed twice on one worker
+  PASS: repair tasks completed (DONE) with no failures
+  docker start worker1 (it comes back with its old chunks -> surplus gets trimmed)
+  PASS: worker1 HEALTHY again (after ~3s)
+  PASS: surplus trimmed: exactly 2 replica rows per chunk (after ~9s)
+  PASS: all chunks still 2 healthy after return
+  PASS: download correct after return
+== 2. Corrupted replica (found on read) -> controller repair ==
+  corrupted 93a0967c-67a2-41d9-8ff4-96c42eab0aa8-000001 on worker1
+  PASS: a read detected the bad replica and flagged it
+  PASS: replica repaired and HEALTHY again (after ~0s)
+  PASS: repaired file on worker1 now serves correct bytes
+  PASS: chunk back to 2 healthy replicas
+  PASS: download identical
+== 3. Chunk file deleted from a worker -> inventory reconciliation ==
+  removed 93a0967c-67a2-41d9-8ff4-96c42eab0aa8-000002 from worker2
+  PASS: reconciler detected it and queued a repair task (after ~9s)
+  PASS: missing file recreated on worker2 and verified (after ~0s)
+  PASS: chunk 2 has 2 healthy replicas
+  PASS: download identical
+== 4. Unknown/tombstoned files on a worker ==
+  PASS: tombstoned chunk resurrected on worker1 is removed (after ~9s)
+  PASS: orphan exists initially
+  PASS: unknown orphan removed after grace period (not immediately) (after ~30s)
+== 5. Degraded mode: only some workers up ==
+  stopped worker2,3,4 (only worker1 alive)
+  PASS: workers marked DEAD (after ~12s)
+  PASS: status reports under-replicated chunks
+  PASS: some repair tasks are waiting (PENDING) for capacity/workers
+  PASS: none declared unrecoverable
+  restarting workers
+  PASS: cluster fully repaired after workers return (after ~3s)
+  PASS: download identical after recovery
+== 6. Both replicas destroyed -> unrecoverable, never fabricated ==
+  PASS: chunk flagged UNRECOVERABLE (after ~12s)
+  PASS: download fails cleanly (http=503 rc=0) instead of returning wrong data
+
+Result: 32 passed, 0 failed
+
+################ phase 7 scrubbers
+== Setup: scrub every 40s (staggered), slow reconcile so only the scrubber detects problems ==
+  PASS: cluster healthy (after ~0s)
+  test object 4bc4b525-7459-4557-8d04-b707453e01de
+== A. Required demo: silent corruption found by the worker scrubber (no client read involved) ==
+  step 1-2: chunk 4bc4b525-7459-4557-8d04-b707453e01de-000002
+            expected checksum sha256:e2229e0a83258740dd849ffd125cd558583384d4a2c456b541c7a6fa0923d132
+            replicas: worker1 and worker3
+  PASS: two replicas on different workers
+  step 3: modified bytes inside the replica on worker1 (size unchanged)
+  PASS: step 4-5: scrubber reported CORRUPT with expected/actual checksums (after ~33s)
+            scrub result: expected | actual = sha256:e2229e0a83258740dd849ffd125cd558583384d4a2c456b541c7a6fa0923d132 | sha256:8e1a8f2367c419f31a36992319b47b52b17c82773fff8cd4c84abbbfb34a8b59
+  PASS: reported expected == authoritative checksum
+  PASS: reported actual differs
+  PASS: step 6-9: replica repaired -> HEALTHY again (after ~3s)
+  PASS: step 6: repair task was created by the scrub report
+  PASS: step 7: healthy replica worker3 was the copy source
+  PASS: step 8: target worker1 received it (task target)
+  PASS: step 9: task DONE
+  PASS: step 9: 2 healthy replicas on different workers again
+  PASS: replaced file serves the original bytes
+  PASS: step 10: full download matches original
+            controller log: controller  | 2026-11-16 16:58:53,371 INFO [controller] controller.repair: repaired 4bc4b525-7459-4557-8d04-b707453e01de-000002: copied directly from worker3 to worker1 (checksum verified, fsynced)
+== B. Missing chunk file (checksum record left behind) -> scrubber reports MISSING ==
+  PASS: scrubber reported MISSING (after ~36s)
+  PASS: missing replica restored (after ~3s)
+  PASS: download identical
+== C. Manual trigger + per-worker scrub status ==
+  PASS: every worker finished at least one pass
+    worker1: passes=105 checked=48 bytes=40967497 corrupt=0 missing=0 (1.62s)
+    worker2: passes=105 checked=49 bytes=43434246 corrupt=0 missing=0 (1.72s)
+    worker3: passes=98 checked=49 bytes=40937246 corrupt=0 missing=0 (1.62s)
+    worker4: passes=101 checked=48 bytes=43853095 corrupt=0 missing=0 (1.73s)
+  PASS: no false positives: only the deliberately corrupted chunk (index 2) has a CORRUPT finding
+  PASS: worker exposes scrub metrics (bytes, duration)
+== D. Controller down: reports survive in the durable queue and are delivered later ==
+  PASS: report waits in worker's durable queue (controller down)
+  PASS: delivery failures are counted
+  restarting the worker too: the queue must survive a worker restart
+  PASS: queued report still on disk after worker restart
+  PASS: report delivered after controller returned (after ~3s)
+  PASS: controller recorded the finding
+  PASS: and repaired it (after ~0s)
+  PASS: download identical
+== E. Report validation, idempotency, stale/false reports ==
+  PASS: unknown worker -> 404
+  PASS: invalid status -> 400
+  PASS: missing field -> 400
+  PASS: report for unknown chunk is acknowledged but ignored
+  PASS: stale report (older than replica write) ignored
+  PASS: replica still HEALTHY after stale report
+  PASS: false positive (bytes match authoritative checksum) ignored
+  PASS: replica still HEALTHY after false positive
+  PASS: genuine report marks replica corrupt
+  PASS: duplicate delivery is harmless (idempotent)
+  PASS: stored once
+  PASS: only one repair task for it
+  PASS: repair (re-copy of already good bytes) finishes, replica HEALTHY (after ~0s)
+  PASS: cluster back to 2 healthy per chunk
+
+Result: 40 passed, 0 failed
+
+################ phase 8 caching
+== Setup: small caches so limits are visible (meta: 3 entries, 5s TTL; worker: 3 MiB) ==
+  PASS: all 4 workers HEALTHY (after ~0s)
+  test object 3e9e8d40-7af4-44a1-b7df-940d362749c3 (8 chunks)
+== 1. Controller metadata cache: hit/miss ==
+  PASS: first read = 1 miss
+  PASS: next two reads (metadata + download) = 2 hits
+  PASS: download via cached manifest is byte-identical
+== 2. Invalidation on metadata PATCH (no stale metadata) ==
+  PASS: PATCH invalidated the entry
+  PASS: next read shows the new value immediately
+== 3. Invalidation on replica health change + repair completion ==
+  PASS: read-time corruption detection invalidated the cached manifest
+  PASS: metadata API never shows a state the DB did not have (db=HEALTHY api=HEALTHY db=HEALTHY)
+  PASS: repair finished (after ~0s)
+  PASS: after repair the API reports the replica HEALTHY
+  PASS: download identical after repair
+== 4. TTL expiry ==
+  PASS: entry expired after the 5s TTL
+== 5. Size bound (3 entries) + LRU eviction ==
+  PASS: never more than 3 entries
+  PASS: older entries were evicted (>=2)
+== 6. Invalidation on worker state change ==
+  PASS: worker1 DEAD (after ~12s)
+  PASS: worker going DEAD cleared the cache
+  PASS: download still correct with worker1 down
+== 7. Controller restart clears its cache (data is in PostgreSQL) ==
+  PASS: controller back (after ~2s)
+  PASS: cache empty after restart
+  PASS: object still served after restart
+== 8. Delete: no stale manifest ==
+  PASS: metadata -> 404 right after DELETE
+  PASS: download -> 404 right after DELETE
+== 9. Worker chunk cache: write-through, hit/miss, stats ==
+  PASS: just-written chunk is already cached (write-through) -> HIT
+  PASS: cold read -> MISS (from disk)
+  PASS: warm read -> HIT
+  PASS: exactly 1 disk read for the two reads
+  PASS: hit counted
+  PASS: bytes_served_from_cache grew by one chunk
+  PASS: cached bytes verify against authoritative checksum
+== 10. Byte budget + eviction never deletes files ==
+  worker2 holds 5 chunks of this object (budget 3 MiB)
+  PASS: cache bytes <= 3 MiB budget
+  PASS: evictions happened
+  PASS: every chunk still readable from disk after evictions
+  PASS: chunk files still all on disk (eviction never deletes)
+== 11. Corruption: cached copy evicted when the scrubber finds the damage ==
+  PASS: chunk is cached
+  after silent disk corruption a read returns: 200 HIT (cache serves the previously verified bytes)
+  PASS: cached good bytes still served (documented trade-off, scrubber closes the gap)
+  PASS: scrub finding evicted the cached entry (invalidation counter +1)
+  PASS: repaired replica serves correct bytes again (after ~0s)
+  PASS: repaired bytes are the original chunk
+== 12. Delete evicts cached chunks ==
+  PASS: chunk gone from worker (after ~2s)
+  PASS: deleted chunk is not served from cache
+== 13. Worker restart clears RAM cache, disk survives ==
+  PASS: cache empty after restart
+  PASS: chunk still readable (MISS from disk)
+== 14. Caches disabled: correct, and counters stay at zero ==
+  PASS: all 4 workers HEALTHY (after ~0s)
+  PASS: metadata cache reports disabled
+  PASS: no metadata hits when disabled
+  PASS: download identical with caches off
+  PASS: worker read -> MISS
+  PASS: worker read again -> still MISS (no caching)
+  PASS: worker hits stay 0
+
+Result: 49 passed, 0 failed
+
+################ phase 9 concurrency + memory
+  PASS: all 4 workers HEALTHY (after ~0s)
+== 1. Cluster status / metrics endpoints ==
+  PASS: controller + database health reported
+  PASS: workers: id, state, heartbeat age, free/used capacity
+  PASS: object / chunk counts
+  PASS: replica counts by state + under-replicated + repair task counts
+  PASS: per-worker last scrub (or null before the first pass)
+  PASS: cache statistics (controller)
+  PASS: detail=true includes each live worker's own status (cache, scrub, disk)
+  PASS: controller /internal/metrics has counters + gates
+  PASS: worker /internal/metrics has counters + cache + scrub
+  PASS: every response carries X-Request-ID
+  PASS: client-supplied X-Request-ID is echoed
+== 2. Many concurrent clients: bounded in-flight work, no corruption ==
+  12 parallel uploads: 12 created, 0 told to retry (503)
+  PASS: every request ended as 201 or a clean 503 (nothing else)
+  PASS: all created objects download byte-identical
+  PASS: uploads in flight never exceeded the limit (4)
+  PASS: controller chunk transfers never exceeded the limit (8)
+  PASS: worker transfer gate respected (limit 8)
+  8 parallel downloads
+  PASS: parallel downloads all identical
+== 3. Backpressure: 1 upload slot, 1s admission timeout, 2 MiB size cap ==
+  PASS: controller up (after ~2s)
+  PASS: first (slow) upload completed -> 201
+  PASS: second upload waited, then was rejected -> 503
+  PASS: error code is server_busy
+  PASS: Retry-After header present
+  PASS: rejection counted in metrics
+  PASS: upload over the size cap -> 400
+  PASS: error code too_large
+  PASS: oversized upload left nothing in staging
+  PASS: controller back to defaults (after ~2s)
+== 4. Memory does not grow with object size ==
+  PASS: all 4 workers HEALTHY (after ~0s)
+  after a 16 MiB upload:   controller peak RSS 65 MiB, worker1 peak RSS 69 MiB
+  384 MiB upload took 9s
+  after a 384 MiB upload:  controller peak RSS 92 MiB, worker1 peak RSS 210 MiB
+  PASS: 384 MiB object committed
+  PASS: controller peak RSS grew < 40 MiB despite 24x larger object
+  PASS: worker peak RSS = baseline + its 128 MiB chunk-cache budget + small slack (not the object size)
+  384 MiB download took 5s
+  PASS: 384 MiB download byte-identical
+  after the 384 MiB download: controller peak RSS 91 MiB
+  PASS: download also stays flat (< 40 MiB over the 16 MiB baseline)
+  memory plateau: three more 384 MiB uploads (1.1 GiB more data through the same worker)
+  after the 2nd 384 MiB upload: worker1 peak RSS 300 MiB (chunk cache is full; allocator + concurrency overhead included)
+  PASS: worker peak stays under baseline + cache budget + 128 MiB overhead
+  after the 4th 384 MiB upload: worker1 peak RSS 300 MiB
+  PASS: plateau: 768 MiB more data raised the worker's peak by < 40 MiB
+  6 concurrent 16 MiB uploads
+  controller peak RSS after concurrency: 123 MiB
+  PASS: memory bounded by concurrency limits, not by data volume (< 150 MiB total)
+== 5. Background scrubbing is rate-limited (foreground I/O keeps priority) ==
+  PASS: worker1 finished a scrub pass over its larger data set (after ~34s)
+  scrubbed 860 MiB in 35.6s = 24.1 MiB/s (limit 25)
+  PASS: scrub throughput stayed at or below the configured rate (+25% slack)
+
+Result: 39 passed, 0 failed
+
+################ phase 10 restarts + persistence
+  PASS: controller healthy + 4 workers HEALTHY (after ~0s)
+  object 50dadfc3-57fd-4ba6-a086-e8cf276f00f2
+== 1. Controller restart: PostgreSQL metadata survives ==
+  PASS: controller back (after ~2s)
+  PASS: metadata, checksums, chunk placement unchanged
+  PASS: object still downloads identically
+  PASS: object still listed
+  PASS: controller healthy + 4 workers HEALTHY (after ~0s)
+== 1b. Controller down LONGER than the heartbeat timeout, workers alive: nobody is declared dead ==
+  controller stopped for 25 s (heartbeat timeout is 15 s)
+  PASS: controller back (after ~2s)
+  PASS: controller healthy + 4 workers HEALTHY (after ~0s)
+  PASS: no worker was marked DEAD after the restart
+  PASS: start-up probe found all 4 workers alive
+  PASS: no repair tasks were created by the restart
+  PASS: no chunk is under-replicated
+== 2. Controller restart while an upload is waiting in staging ==
+  PASS: upload could not finish (only 1 worker) -> 503, kept in staging
+  PASS: staged file is on the persistent staging volume
+  PASS: controller back (after ~2s)
+  PASS: staged file survived the controller restart (no re-upload needed)
+  PASS: upload is still unfinished (not visible yet)
+  PASS: controller resumed the staged upload on its own (after ~2s)
+  PASS: resumed object is byte-identical to the original
+  PASS: no duplicate objects: exactly one committed object has this upload id
+  PASS: staging cleaned up
+  PASS: controller healthy + 4 workers HEALTHY (after ~0s)
+== 3. Each worker restarted: its persistent chunks remain ==
+  PASS: worker1: this test's chunk files (ids + checksums) identical after restart
+  PASS: worker2: this test's chunk files (ids + checksums) identical after restart
+  PASS: worker3: this test's chunk files (ids + checksums) identical after restart
+  PASS: worker4: this test's chunk files (ids + checksums) identical after restart
+  PASS: controller healthy + 4 workers HEALTHY (after ~0s)
+  PASS: download after all worker restarts
+== 4. PostgreSQL down and back: controller reconnects, answers 503 meanwhile ==
+  PASS: database down: an upload that needs it fails with 503 (not 500)
+  PASS: database down: error body is the standard JSON
+  keeping the database down for 20 s (longer than the 15 s heartbeat timeout) to prove workers are not wrongly declared DEAD
+  PASS: controller reports the database healthy again (after ~2s)
+  PASS: all 4 workers still HEALTHY after the outage (grace period worked)
+  PASS: no repair storm was triggered by the outage
+  PASS: metadata intact after the database restarted
+  PASS: download works after the database restarted
+  PASS: new uploads work after the database restarted
+  PASS: controller healthy + 4 workers HEALTHY (after ~0s)
+== 5. Whole stack restart (docker compose restart) ==
+  PASS: controller healthy + 4 workers HEALTHY (after ~2s)
+  PASS: object intact after full restart
+  PASS: all chunks still have 2 healthy replicas
+
+Result: 40 passed, 0 failed
+
+################ phase 11 upload crash safety
+  PASS: controller healthy + 4 workers HEALTHY (after ~0s)
+== 1. Normal upload still works and leaves nothing behind ==
+  PASS: upload -> 201
+  PASS: name and metadata are the real ones, not placeholders
+  PASS: download identical
+  PASS: no upload row left
+  PASS: no staging file left
+== 2. Crash states left behind, then a controller restart ==
+  PASS: controller back (after ~2s)
+  PASS: (a) orphan .staged file without a row was removed
+  PASS: (b) STREAMING row was dropped
+  PASS: (b) its partial file was removed
+  PASS: (b) its Idempotency-Key is free again
+  PASS: (c) upload interrupted after the commit point was finished by the controller (after ~0s)
+  PASS: (c) download identical to the original
+  PASS: (c) name and metadata survived the crash
+  PASS: (c) staging cleaned
+  PASS: (c) client retry with the same key gets the finished object (200), no re-upload
+== 3. Retry that finds a dead STREAMING row with its key is not blocked ==
+  PASS: upload with the reused key -> 201 (not 409)
+  PASS: the dead row is gone
+== 4. Client disconnects mid-upload ==
+  PASS: while streaming, the database already knows the upload (STREAMING row)
+  PASS: after the disconnect the STREAMING row is removed (after ~0s)
+  PASS: and the partial file is removed
+== 5. Two simultaneous uploads with the same Idempotency-Key ==
+  PASS: the second one gets 409 while the first is still streaming
+  PASS: after the first one disconnects, its key is released (after ~0s)
+
+Result: 23 passed, 0 failed
+
+================ SUMMARY
+  PASS   unit tests
+  PASS   phase 2+3 worker storage, heartbeats
+  PASS   phase 4 upload path
+  PASS   phase 5 download/list/patch/delete
+  PASS   phase 6 failures + repair
+  PASS   phase 7 scrubbers
+  PASS   phase 8 caching
+  PASS   phase 9 concurrency + memory
+  PASS   phase 10 restarts + persistence
+  PASS   phase 11 upload crash safety

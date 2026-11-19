@@ -33,6 +33,36 @@ takes 30 s. worker2 is not marked bad, because it is only slow. The script then 
 100 bytes, a range across a chunk boundary, the last 1000 bytes, and a 416 for a range past the end. On the dashboard,
 *Hedged reads · per min* shows the hedges and their wins.
 
+**Extra: chaos under load (self-healing).** Run steady traffic and random faults side by side with the dashboard open:
+
+```bash
+python3 scripts/load.py                  # terminal 1: clients uploading/downloading, every byte verified
+./scripts/chaos.sh --rounds 5            # terminal 2: stop / pause / corrupt / delete / restart-controller
+```
+
+The chaos script injects one fault, prints when it was detected and when the cluster was healthy again, then picks
+the next one. It ends with a table:
+
+```
+  #   fault       target    detected   healed    result
+  1   corrupt     worker3   3s         4s        ok
+  2   delete      worker2   21s        21s       ok
+  3   pause       worker1   -          8s        ok, 3 hedged
+  4   controller  api       2s         2s        ok
+  5   stop        worker4   14s        46s       ok
+```
+
+What to point at:
+* **Faults on the graphs.** Each fault is a purple band on every graph, from injection to healed. Firing alerts are a
+  red band (critical, e.g. `WorkerDown worker4`) or a short blue marker (info, e.g. `CorruptReplicaDetected`). The
+  *Active alerts* table at the top says what each alert means.
+* **The load generator's view.** It shows the client side. It reports no wrong bytes at any point. During the
+  controller restart it shows a few connection errors, and while a worker is frozen, slower uploads (reads are hedged,
+  writes are not).
+* **Alerts that stay quiet.** `ChunksUnderReplicated` does not fire, because a dead worker's chunks are
+  re-replicated in about 20 s, well inside its 1-minute threshold. `ControllerDown` does not fire for a 2-second
+  restart either. Both are set up to catch failures that last, not blips.
+
 **Traces.** Open Jaeger at http://localhost:16686 (service `controller`) after any demo. Each upload, download,
 repair and rebalance move is one timeline across the controller and the workers it touched.
 * **Demo 2 (upload):** each chunk shows the chain `controller → first worker (write, fsync) → forward → second worker
@@ -42,10 +72,11 @@ repair and rebalance move is one timeline across the controller and the workers 
 * **Demo 8 (slow worker):** download traces show a `hedge` event on the chunk whose first replica was frozen, and the
   second replica answering.
 
-**Live dashboard.** Open http://localhost:3000 (Grafana, no login) next to the terminal while running demos 5 and 6:
+**Live dashboard.** Open http://localhost:3000 (Grafana, no login) next to the terminal while running demos 5 and 6.
+For moving traffic graphs, keep `python3 scripts/load.py` running in another terminal.
 
 * Demo 5: on *Reachability*, worker2 turns DOWN within ~5 s. On *Worker state*, it turns DEAD at the 15 s heartbeat
-  timeout. *Under-replicated chunks* jumps and returns to 0 while worker2 is still down. *Repair activity* shows the
+  timeout, and the `WorkerDown worker2` alert appears in *Active alerts* and as a red band across every graph. *Under-replicated chunks* jumps and returns to 0 while worker2 is still down. *Repair activity* shows the
   worker-to-worker copies. After `docker start worker2`, the surplus copies are trimmed (*Healthy replicas per worker*).
 * Demo 6: *Corrupt copies detected* / *Missing copies detected* go up, the *Corruption and loss events* panel shows
   which path found each problem (read check, worker self-check, scrubber), and *Time to heal* shows how quickly the

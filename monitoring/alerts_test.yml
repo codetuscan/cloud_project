@@ -1,0 +1,99 @@
+# Unit tests for alerts.yml (synthetic series, no cluster needed):
+#   docker run --rm --entrypoint promtool -v $PWD/monitoring:/m:ro prom/prometheus:v2.53.0 test rules /m/alerts_test.yml
+rule_files: [alerts.yml]
+evaluation_interval: 5s
+
+tests:
+  # A worker marked DEAD fires WorkerDown at once; a drained one only gets the info alert.
+  - interval: 5s
+    input_series:
+      - series: 'objstore_worker_alive{job="controller",instance="controller:8080",worker_id="worker2"}'
+        values: '1 1 0x10'
+      - series: 'objstore_worker_draining{job="controller",instance="controller:8080",worker_id="worker2"}'
+        values: '0x12'
+      - series: 'objstore_worker_alive{job="controller",instance="controller:8080",worker_id="worker4"}'
+        values: '1 1 0x10'
+      - series: 'objstore_worker_draining{job="controller",instance="controller:8080",worker_id="worker4"}'
+        values: '1x12'
+    alert_rule_test:
+      - eval_time: 5s
+        alertname: WorkerDown
+        exp_alerts: []
+      - eval_time: 20s
+        alertname: WorkerDown
+        exp_alerts:
+          - exp_labels: {severity: critical, worker_id: worker2, job: controller, instance: "controller:8080",
+                         summary: "Worker DEAD (no heartbeat); its copies are being re-replicated"}
+            exp_annotations:
+              description: "worker2 missed heartbeats for HEARTBEAT_TIMEOUT. Chunks it held have one copy left until repair copies them elsewhere."
+      - eval_time: 20s
+        alertname: WorkerDrainedAndStopped
+        exp_alerts:
+          - exp_labels: {severity: info, worker_id: worker4, job: controller, instance: "controller:8080",
+                         summary: "Drained worker stopped; remove it with DELETE /internal/workers/<id>"}
+            exp_annotations:
+              description: "worker4 was drained and is now DEAD, as expected during scale-in."
+
+  # Under-replication only alerts after 1 minute; a quick repair never raises it.
+  - interval: 5s
+    input_series:
+      - series: 'objstore_under_replicated_chunks{job="controller",instance="controller:8080"}'
+        values: '0 4x20 0x5'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: ChunksUnderReplicated
+        exp_alerts: []
+      - eval_time: 70s
+        alertname: ChunksUnderReplicated
+        exp_alerts:
+          - exp_labels: {severity: warning, job: controller, instance: "controller:8080",
+                         summary: "Chunks with fewer than 2 healthy copies for over 1 min"}
+            exp_annotations:
+              description: "4 chunk(s) are one failure away from being unavailable. Repair should bring this to 0."
+      - eval_time: 125s
+        alertname: ChunksUnderReplicated
+        exp_alerts: []
+
+  # Scrub overdue: relative to the worker's own SCRUB_INTERVAL (here 60 s -> threshold 720 s).
+  - interval: 60s
+    input_series:
+      - series: 'objstore_scrub_interval_seconds{job="workers",instance="worker1:9000",worker_id="worker1"}'
+        values: '60x20'
+      - series: 'objstore_scrub_last_finished_timestamp_seconds{job="workers",instance="worker1:9000",worker_id="worker1"}'
+        values: '0x20'
+      - series: 'objstore_scrub_interval_seconds{job="workers",instance="worker3:9000",worker_id="worker3"}'
+        values: '60x20'
+      - series: 'objstore_uptime_seconds{job="workers",instance="worker3:9000",worker_id="worker3"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ScrubOverdue
+        exp_alerts: []
+      - eval_time: 13m
+        alertname: ScrubOverdue
+        exp_alerts:
+          - exp_labels: {severity: warning, job: workers, instance: "worker1:9000", worker_id: worker1,
+                         summary: "Scrubber has not finished a pass in 2x SCRUB_INTERVAL"}
+            exp_annotations:
+              description: "Bit rot on worker1 could go unnoticed: the background scrubber is overdue."
+          - exp_labels: {severity: warning, job: workers, instance: "worker3:9000", worker_id: worker3,
+                         summary: "Scrubber has not finished a pass in 2x SCRUB_INTERVAL"}
+            exp_annotations:
+              description: "Bit rot on worker3 could go unnoticed: the background scrubber is overdue."
+
+  # A corrupt copy found -> info marker for ~2 min, then it clears by itself.
+  - interval: 15s
+    input_series:
+      - series: 'objstore_replicas_marked_corrupt_total{job="controller",instance="controller:8080"}'
+        values: '0 0 1x20'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: CorruptReplicaDetected
+        exp_alerts:
+          - exp_labels: {severity: info, job: controller, instance: "controller:8080",
+                         summary: "A corrupt copy was found and is being repaired"}
+            exp_annotations:
+              description: "A replica failed its checksum (read check, scrubber or repair). A repair task replaces it."
+      - eval_time: 4m
+        alertname: CorruptReplicaDetected
+        exp_alerts: []

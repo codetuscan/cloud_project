@@ -272,6 +272,32 @@ dependency) from the same in-process counters that `/internal/metrics` returns a
     queue. Jaeger being down costs nothing but the spans.
   - **Finding a trace:** `X-Trace-Id` on responses and `trace=<id>` in log lines link a request, its logs and its
     timeline.
+* **Alerts** (`monitoring/alerts.yml`, 17 rules, evaluated every 5 s):
+  - **Severities:** *critical* means clients are affected now (controller, database or a worker down; a chunk with no
+    readable copy; data lost). *warning* means redundancy or upkeep is degraded (under-replicated for over 1 min, a
+    repair stuck for 5 min, scrubber overdue, low disk, uploads or requests rejected with 503). *info* marks an event the
+    system is already handling (corrupt or missing copy found, slow replica answered by the hedge).
+  - **Delays are chosen to avoid noise:** `WorkerDown` uses the controller's DEAD decision, which already waited out the
+    heartbeat timeout. `ChunksUnderReplicated` waits 1 min because a normal repair finishes well inside that.
+    `ScrubOverdue` is relative to each worker's own `SCRUB_INTERVAL` (a new gauge, `objstore_scrub_interval_seconds`).
+    A drained worker that is stopped raises only an info alert.
+  - **On the dashboard:** the `summary` text is an alert *label*, because Prometheus exports labels but not annotations
+    to the `ALERTS` series, and Grafana reads that series. The *Active alerts* table joins `ALERTS` with
+    `ALERTS_FOR_STATE`, which holds the time each alert became active. Annotation queries draw firing alerts as bands
+    across all graphs.
+  - **No Alertmanager:** alerts are for watching, not paging.
+  - **Tests:** the rules have promtool unit tests (`monitoring/alerts_test.yml`).
+* **The scrubber schedule follows the wall clock.** The first alert run caught a real gap: a pass is due
+  `SCRUB_INTERVAL` after the previous one *finished*, and that time is persisted. Before, every worker restart started
+  a new staggered countdown, and a suspended host paused the asyncio timer, so passes could be more than an hour late.
+  Now a restart keeps the schedule, and an overdue pass starts within a minute.
+* **Load and chaos tools** (`scripts/load.py`, `scripts/chaos.sh`):
+  - **Load** uses only the Python standard library. Object contents come from a seeded generator, so any downloaded
+    byte range can be checked exactly without keeping objects in memory.
+  - **Chaos** injects one fault at a time and only after the cluster is fully healthy. It never takes two workers
+    down. Byte-level faults hit only its own test object, which is verified after each fault. It measures
+    detection and heal times from PostgreSQL (repair task created / DONE), not from guesses.
+  - **Markers:** both tools post Grafana annotations (tag `objstore-event`) when Grafana is reachable.
 * Monitoring is optional: nothing in the object store depends on Prometheus or Grafana.
 
 ## 11. Decisions on open points from the plan

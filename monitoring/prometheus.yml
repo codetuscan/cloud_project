@@ -5,6 +5,10 @@ global:
   scrape_timeout: 4s       # must not exceed scrape_interval
   evaluation_interval: 5s
 
+# Alert rules (worker down, chunks under-replicated, scrub overdue, ...): see alerts.yml.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: controller
     static_configs:

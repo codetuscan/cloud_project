@@ -58,3 +58,27 @@ def test_report_queue_is_durable_and_deduplicated(tmp_path):
     import json
     item = json.loads(next(scrub._queue_dir().glob("*.json")).read_text())
     assert item["payload"]["n"] == 2
+
+
+# ------------------------------------------------------------------ schedule (wall clock, survives restarts)
+def _finished(monkeypatch, epoch):
+    from datetime import datetime, timezone
+    iso = datetime.fromtimestamp(epoch, timezone.utc).isoformat() if epoch is not None else None
+    monkeypatch.setitem(scrub.state, "last_scrub_finished", iso)
+    monkeypatch.setattr(settings, "scrub_interval", 1800)
+
+
+def test_never_scrubbed_worker_starts_at_its_staggered_offset(monkeypatch):
+    _finished(monkeypatch, None)
+    assert scrub.first_due(10_000, offset=700) == 10_700
+
+
+def test_restart_keeps_the_schedule_of_the_last_pass(monkeypatch):
+    _finished(monkeypatch, 10_000 - 600)                      # last pass 10 min ago
+    assert scrub.first_due(10_000, offset=700) == 10_000 - 600 + 1800   # due in 20 min, not 700 s + 30 min
+
+
+def test_overdue_pass_runs_within_a_minute_after_restart_or_suspend(monkeypatch):
+    _finished(monkeypatch, 10_000 - 5000)                     # host slept / worker was down for longer
+    due = scrub.first_due(10_000, offset=700)
+    assert 10_000 <= due < 10_060 and due == 10_000 + 700 % 60

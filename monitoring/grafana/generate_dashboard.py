@@ -24,6 +24,7 @@ WORKER = {"worker1": SERIES[0], "worker2": SERIES[1], "worker3": SERIES[2], "wor
           "worker5": SERIES[4]}  # worker5 only exists in the scale-out demo
 CONTROLLER = "#9fa7b3"                     # neutral grey for the controller's own series
 GOOD, WARN, SERIOUS, CRIT = "#0ca30c", "#fab219", "#ec835a", "#d03b3b"
+INFO = "#7aa2e0"                           # informational alerts (an event being handled), not a status
 TEXT = "text"                              # Grafana's theme text colour (white in dark, black in light)
 
 panels = []
@@ -165,6 +166,47 @@ def timeline(title, pairs, x, w, h, mappings, steps, desc=""):
                     "tooltip": {"mode": "single"}}})
 
 
+def alert_table(title, x, w, h, desc=""):
+    """Active (pending + firing) alerts: one row each, with the time it became active (ALERTS_FOR_STATE)."""
+    by = "alertname, severity, worker_id, summary"
+    # value = the moment the alert became active, in ms (ALERTS_FOR_STATE holds Unix seconds)
+    expr = (f"max by ({by}, alertstate) (ALERTS) * 0"
+            f" + on ({by}) group_left () (max by ({by}) (ALERTS_FOR_STATE) * 1000)")
+    sev = [{"type": "value", "options": {"critical": {"text": "critical", "color": CRIT, "index": 0},
+                                         "warning": {"text": "warning", "color": WARN, "index": 1},
+                                         "info": {"text": "info", "color": INFO, "index": 2}}}]
+    state = [{"type": "value", "options": {"firing": {"text": "firing", "color": TEXT, "index": 0},
+                                           "pending": {"text": "pending", "color": "#8e8e8e", "index": 1}}}]
+
+    def col(name, props):
+        return {"matcher": {"id": "byName", "options": name}, "properties": props}
+    add({
+        "type": "table", "title": title, "id": nid(), "description": desc, "datasource": DS,
+        "gridPos": {"h": h, "w": w, "x": x, "y": y},
+        "targets": [{"datasource": DS, "expr": expr, "format": "table", "instant": True, "range": False,
+                     "refId": "A", "legendFormat": "__auto"}],
+        "transformations": [{"id": "organize", "options": {
+            "excludeByName": {"Time": True},
+            "indexByName": {"severity": 0, "alertname": 1, "worker_id": 2, "summary": 3, "alertstate": 4, "Value": 5},
+            "renameByName": {"severity": "Severity", "alertname": "Alert", "worker_id": "Worker",
+                             "summary": "What it means", "alertstate": "State", "Value": "Active since"}}}],
+        "fieldConfig": {"defaults": {"custom": {"align": "left", "cellOptions": {"type": "auto"}, "inspect": False},
+                                     "noValue": "All clear: no alerts firing or pending",
+                                     "color": {"mode": "fixed", "fixedColor": TEXT}, "mappings": [],
+                                     "thresholds": thresholds(((None, TEXT),))},
+                        "overrides": [
+                            col("Severity", [{"id": "mappings", "value": sev}, {"id": "custom.width", "value": 90},
+                                             {"id": "custom.cellOptions", "value": {"type": "color-text"}}]),
+                            col("Alert", [{"id": "custom.width", "value": 200}]),
+                            col("Worker", [{"id": "custom.width", "value": 90}]),
+                            col("State", [{"id": "mappings", "value": state}, {"id": "custom.width", "value": 80},
+                                          {"id": "custom.cellOptions", "value": {"type": "color-text"}}]),
+                            col("Active since", [{"id": "unit", "value": "dateTimeFromNow"},
+                                                 {"id": "custom.width", "value": 160}])]},
+        "options": {"showHeader": True, "cellHeight": "sm", "footer": {"show": False},
+                    "sortBy": [{"displayName": "Active since", "desc": True}]}})
+
+
 def vmap(pairs):
     """Range mappings (v-0.5 .. v+0.5) -> text + colour; thresholds below repeat the colours as a fallback."""
     return [{"type": "range", "options": {"from": v - 0.5, "to": v + 0.5,
@@ -186,6 +228,17 @@ WORKER_STATE_EXPR = ('2 * sum by (worker_id) (objstore_worker_state{state="HEALT
 ZERO_OK_WARN = ((None, TEXT), (1, WARN))   # 0 is normal; any value is worth a look
 ZERO_OK_CRIT = ((None, TEXT), (1, CRIT))   # 0 is normal; any value is an outage
 
+
+# ------------------------------------------------------------------------------------------------ alerts
+row("Alerts")
+stat("Firing alerts", 'count(ALERTS{alertstate="firing", severity=~"critical|warning"}) or vector(0)', 0, 3, h=6,
+     steps=((None, TEXT), (1, CRIT)),
+     desc="Critical and warning alerts firing now (info alerts are listed but not counted). Rules: monitoring/alerts.yml.")
+alert_table("Active alerts", 3, 21, 6,
+            desc="Alerts from Prometheus (monitoring/alerts.yml), firing or pending. On every graph below, firing "
+                 "alerts are shaded red (critical), amber (warning) or blue (info), and chaos/load events from "
+                 "scripts/chaos.sh and scripts/load.sh are purple markers.")
+y += 6
 
 # ------------------------------------------------------------------------------------------------ overview
 row("Cluster overview")
@@ -382,14 +435,37 @@ def _strip_empty(p):
 for p in panels:
     _strip_empty(p)
 
+
+def alert_annotation(severity, color, alpha):
+    """Firing alerts of one severity on every graph, labelled e.g. "WorkerDown worker2".
+
+    critical/warning: a translucent band from firing to resolved. info (an event the system is already handling,
+    e.g. a corrupt copy found): only a short marker where it started, since the alert itself is just a 2 min window.
+    """
+    expr = f'ALERTS{{alertstate="firing", severity="{severity}"}}'
+    if severity == "info":
+        expr = f"{expr} unless {expr} offset 15s"
+    fmt = {"titleFormat": "{{alertname}} {{worker_id}}", "textFormat": "{{summary}}", "tagKeys": "severity",
+           "step": "5s", "useValueForTime": False}
+    r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    return {"datasource": DS, "enable": True, "iconColor": f"rgba({r}, {g}, {b}, {alpha})",
+            "name": f"Alerts · {severity}", "expr": expr, **fmt,
+            "target": {"datasource": DS, "expr": expr, "refId": "Anno", "interval": "5s", **fmt}}
+
+
 dash = {
     "uid": "objstore", "title": "Object Store", "tags": ["objstore"], "timezone": "browser",
-    "schemaVersion": 39, "version": 2, "editable": False, "graphTooltip": 1, "liveNow": False,
+    "schemaVersion": 39, "version": 3, "editable": False, "graphTooltip": 1, "liveNow": False,
     "refresh": "5s", "time": {"from": "now-30m", "to": "now"},
     "timepicker": {"refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]},
     "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"},
                               "enable": True, "hide": True, "iconColor": "rgba(0, 211, 255, 1)",
-                              "name": "Annotations & Alerts", "type": "dashboard"}]},
+                              "name": "Annotations & Alerts", "type": "dashboard"}]
+                    + [alert_annotation(*a) for a in (("critical", CRIT, 0.45), ("warning", WARN, 0.3),
+                                                         ("info", INFO, 0.8))]
+                    + [{"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": True,
+                        "iconColor": "rgba(144, 133, 233, 0.35)", "name": "Chaos & load events",
+                        "target": {"type": "tags", "tags": ["objstore-event"], "matchAny": True, "limit": 200}}]},
     "templating": {"list": []}, "panels": panels,
     "links": [{"title": "Traces (Jaeger)", "type": "link", "url": "http://localhost:16686/search?service=controller",
                "icon": "external link", "targetBlank": True,
